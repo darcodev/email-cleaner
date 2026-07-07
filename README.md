@@ -1,5 +1,10 @@
 # email-cleaner
 
+[![CI](https://github.com/darcodev/email-cleaner/actions/workflows/ci.yml/badge.svg)](https://github.com/darcodev/email-cleaner/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Python](https://img.shields.io/badge/python-3.9%2B-blue)
+![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen)
+
 Command line tool that clears promotional email out of your inbox over
 IMAP. You decide what gets cleaned (age, keywords, senders, categories),
 preview it first, and nothing is permanently deleted unless you ask for
@@ -25,10 +30,31 @@ Move 1,240 emails to Trash (recoverable there for ~30 days)? [y/N] y
 
 ## Install
 
-Needs Python 3.9 or newer.
+Needs Python 3.9 or newer. No third-party packages, just the standard library.
+
+The easiest way is pipx, which puts the `email-cleaner` command on your PATH in
+its own isolated environment:
 
 ```bash
-git clone <this repo>
+pipx install git+https://github.com/darcodev/email-cleaner.git
+```
+
+Or with plain pip:
+
+```bash
+pip install git+https://github.com/darcodev/email-cleaner.git
+```
+
+To pin a specific released version, add the tag:
+
+```bash
+pipx install "git+https://github.com/darcodev/email-cleaner.git@v0.3.0"
+```
+
+Prefer to work from a clone?
+
+```bash
+git clone https://github.com/darcodev/email-cleaner.git
 cd email-cleaner
 pip install .
 ```
