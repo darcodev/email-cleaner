@@ -129,7 +129,9 @@ def is_protected(summary: EmailSummary, protected_senders: list[str]) -> bool:
     """Substring match on the sender address, so 'work.com' protects the
     whole domain and 'boss@work.com' protects one person."""
     sender = summary.sender_email.lower()
-    hits = [p for p in protected_senders if p.strip() and p.lower() in sender]
+    # strip before matching too, not just for the blank-check, so a padded
+    # entry like " amazon.com" still protects instead of silently missing
+    hits = [p for p in protected_senders if p.strip() and p.strip().lower() in sender]
     return len(hits) > 0
 
 
@@ -143,6 +145,14 @@ class ScanResult:
     @property
     def total_size(self) -> int:
         return sum(e.size for e in self.emails)
+
+
+def _apply_limit(uids: list[str], limit: int | None) -> list[str]:
+    """Keep at most `limit` matches (the oldest, since UIDs arrive oldest
+    first). None means no cap; 0 means keep none. Negatives clamp to 0."""
+    if limit is None:
+        return uids
+    return uids[: max(limit, 0)]
 
 
 def scan(session: ImapSession, filters: Filters, on_progress=None) -> ScanResult:
@@ -161,8 +171,7 @@ def scan(session: ImapSession, filters: Filters, on_progress=None) -> ScanResult
         uids = session.search_standard(criteria)
         description = "IMAP search: " + " ".join(criteria)
 
-    if filters.limit and len(uids) > filters.limit:
-        uids = uids[: filters.limit]
+    uids = _apply_limit(uids, filters.limit)
 
     summaries = session.fetch_summaries(uids, on_progress=on_progress)
 

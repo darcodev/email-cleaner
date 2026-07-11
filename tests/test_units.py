@@ -21,6 +21,7 @@ from email_cleaner.imap_client import (
 from email_cleaner.providers import get_provider, guess_provider
 from email_cleaner.scanner import (
     Filters,
+    _apply_limit,
     build_gmail_query,
     build_standard_criteria,
     imap_date,
@@ -184,6 +185,29 @@ class TestProtection(unittest.TestCase):
 
     def test_blank_patterns_ignored(self):
         self.assertFalse(is_protected(self._summary("a@b.com"), ["", "  "]))
+
+    def test_whitespace_padded_pattern_still_protects(self):
+        # a stray space around a protect entry must not silently disable it
+        self.assertTrue(is_protected(self._summary("deals@amazon.com"), [" amazon.com"]))
+        self.assertTrue(is_protected(self._summary("deals@amazon.com"), ["amazon.com  "]))
+
+
+class TestApplyLimit(unittest.TestCase):
+    def test_none_keeps_everything(self):
+        self.assertEqual(_apply_limit(["1", "2", "3"], None), ["1", "2", "3"])
+
+    def test_zero_keeps_nothing(self):
+        # --limit 0 means none, not "no limit"
+        self.assertEqual(_apply_limit(["1", "2", "3"], 0), [])
+
+    def test_trims_to_the_oldest(self):
+        self.assertEqual(_apply_limit(["1", "2", "3"], 2), ["1", "2"])
+
+    def test_limit_above_count_keeps_everything(self):
+        self.assertEqual(_apply_limit(["1", "2", "3"], 9), ["1", "2", "3"])
+
+    def test_negative_clamps_to_none_kept(self):
+        self.assertEqual(_apply_limit(["1", "2", "3"], -5), [])
 
 
 class TestUnsubscribeParsing(unittest.TestCase):
