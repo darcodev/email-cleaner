@@ -263,6 +263,11 @@ class TestUiHelpers(unittest.TestCase):
         self.assertEqual(human_size(1536), "1.5 KB")
         self.assertEqual(human_size(48 * 1024 * 1024), "48.0 MB")
 
+    def test_human_size_rolls_over_at_boundary(self):
+        # 1048544 is 1023.97 KB; it must read as 1.0 MB, not "1024.0 KB"
+        self.assertEqual(human_size(1048544), "1.0 MB")
+        self.assertEqual(human_size(1024 * 1024), "1.0 MB")
+
     def test_truncate(self):
         self.assertEqual(truncate("hello", 10), "hello")
         self.assertEqual(truncate("hello world", 8), "hello...")
@@ -328,6 +333,19 @@ class TestDotenv(unittest.TestCase):
     def test_strips_quotes_and_export(self):
         config.load_dotenv(self._write('export EMAIL_CLEANER_PASSWORD="a b c"\n'))
         self.assertEqual(os.environ["EMAIL_CLEANER_PASSWORD"], "a b c")
+
+    def test_strips_leading_bom(self):
+        # Notepad / PowerShell write a UTF-8 BOM; the first key must still parse
+        config.load_dotenv(self._write("﻿EMAIL_CLEANER_EMAIL=me@gmail.com\n"))
+        self.assertEqual(os.environ["EMAIL_CLEANER_EMAIL"], "me@gmail.com")
+
+    def test_strips_inline_comment(self):
+        config.load_dotenv(self._write("EMAIL_CLEANER_HOST=h.example.com  # main server\n"))
+        self.assertEqual(os.environ["EMAIL_CLEANER_HOST"], "h.example.com")
+
+    def test_hash_inside_quoted_value_is_kept(self):
+        config.load_dotenv(self._write('EMAIL_CLEANER_PASSWORD="a # b"\n'))
+        self.assertEqual(os.environ["EMAIL_CLEANER_PASSWORD"], "a # b")
 
     def test_real_env_is_not_overwritten(self):
         os.environ["EMAIL_CLEANER_EMAIL"] = "real@env.com"

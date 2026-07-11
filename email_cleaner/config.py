@@ -31,18 +31,37 @@ def _find_dotenv() -> Path:
     return candidates[0]
 
 
+def _clean_value(value: str) -> str:
+    """Tidy the right-hand side of a KEY=VALUE line.
+
+    A quoted value keeps everything between the quotes verbatim, so a '#' or
+    spaces in a password survive. An unquoted value has a trailing inline
+    '# comment' stripped, matching how people annotate a .env.
+    """
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    marker = value.find(" #")  # inline comment must have space before the hash
+    if marker != -1:
+        value = value[:marker]
+    return value.strip()
+
+
 def load_dotenv(path: Path | None = None) -> None:
     """Pull KEY=VALUE lines out of a .env file into os.environ.
 
     Not a real dotenv library, we dont need one - just enough to read the
-    handful of EMAIL_CLEANER_* keys. Handles blank lines, # comments, a
-    stray 'export ' prefix, and optional quotes around the value. Anything
-    already set in the real environment wins and is left alone.
+    handful of EMAIL_CLEANER_* keys. Handles blank lines, full-line and inline
+    # comments, a stray 'export ' prefix, optional quotes around the value, and
+    a UTF-8 BOM (Windows editors like Notepad add one). Anything already set in
+    the real environment wins and is left alone.
     """
     path = path or _find_dotenv()
     if not path.exists():
         return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    # utf-8-sig drops a leading BOM if there is one, so the first key doesn't
+    # come through with a stray BOM prefix and then get looked up wrong
+    for raw in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -52,7 +71,7 @@ def load_dotenv(path: Path | None = None) -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        value = _clean_value(value)
         # rebuild the list of what's already set each time - tiny file, dont care
         already_set = [name for name in os.environ]
         if key and key not in already_set:

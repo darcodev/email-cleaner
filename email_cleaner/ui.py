@@ -102,7 +102,9 @@ def human_size(num_bytes: int) -> str:
     """1234567 -> '1.2 MB'"""
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if size < 1024 or unit == "TB":
+        # compare the rounded value so e.g. 1023.97 KB rolls up to 1.0 MB
+        # instead of printing a nonsensical "1024.0 KB"
+        if round(size, 1) < 1024 or unit == "TB":
             if unit == "B":
                 return f"{int(size)} {unit}"
             return f"{size:.1f} {unit}"
