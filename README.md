@@ -40,6 +40,7 @@ Move 1,240 emails to Trash (recoverable there for ~30 days)? [y/N] y
 - [Filters in detail](#filters-in-detail)
 - [The three ways to delete](#the-three-ways-to-delete)
 - [How it decides what is promotional](#how-it-decides-what-is-promotional)
+- [AI-assisted filtering (optional)](#ai-assisted-filtering-optional)
 - [Recipes](#recipes)
 - [Best practices](#best-practices)
 - [Automating it](#automating-it)
@@ -280,6 +281,96 @@ Starred and important mail is always skipped unless you pass `--include-starred`
 and protected senders are re-checked on your machine for every message, even if
 the server search returned them.
 
+## AI-assisted filtering (optional)
+
+The normal filters (age, keyword, sender, category, unsubscribe header) are fast
+and predictable, but blunt: they cannot tell a shipping notification apart from a
+"40% off shipping supplies" ad. An optional AI pass can. You describe in plain
+language what you want gone, and a model makes a keep-or-delete call on each
+message. It is **off by default** and turns on only when you pass `--ai`.
+
+Two things make it safe to bolt onto a tool that deletes mail:
+
+- **It can only narrow, never widen.** The model only ever decides keep-or-delete
+  among the messages your normal filters already matched. Worst case, it keeps
+  mail that would otherwise be trashed. It can never reach for a message the
+  base filters did not select.
+- **It fails safe.** If the backend is unreachable, times out, or returns
+  something that will not parse, those messages default to *keep*. An AI outage
+  can only ever cause fewer deletions, never more. Protected and starred mail is
+  filtered out on your machine *before* anything is sent to the model, and is
+  never deleted regardless of what the model says.
+
+Run it read-only first, exactly like a normal scan:
+
+```bash
+email-cleaner scan --ai --ai-prompt "marketing and newsletters, but keep orders, flights and money"
+email-cleaner scan --ai --ai-explain    # also show the model's one-line reason per match
+```
+
+Add `--ai-explain` to see, per message, why the model wants to drop it, so you
+can sanity-check the judgment before running `clean`.
+
+### Backends
+
+You need a model to talk to. Point the tool at one with `EMAIL_CLEANER_AI_BACKEND`
+(or `--ai-backend`). There are no Python packages to install for any of these -
+the tool speaks plain HTTP+JSON to whatever you point it at.
+
+| Backend | What it is | Data leaves your machine? |
+| --- | --- | --- |
+| `ollama` | A local [Ollama](https://ollama.com) daemon (default `http://localhost:11434`). You install and run Ollama and pull a model yourself. | **No.** This is the recommended, private option. |
+| `openai` | Any endpoint speaking the OpenAI `/v1/chat/completions` shape - OpenAI itself, most hosted providers, or a compatible local server. Needs an API key. | Yes, to that provider. |
+| `anthropic` | The Anthropic Messages API. Needs an API key. | Yes, to Anthropic. |
+
+The local Ollama path is the one to reach for first: nothing about your mail
+goes anywhere it does not already go. Set it up once:
+
+```bash
+# 1. install Ollama (see ollama.com), then pull a small model
+ollama pull llama3.1
+# 2. tell email-cleaner to use it (in .env, or as flags)
+EMAIL_CLEANER_AI_BACKEND=ollama
+EMAIL_CLEANER_AI_PROMPT=marketing and newsletters, but keep orders, flights and money
+# 3. preview
+email-cleaner scan --ai
+```
+
+For a hosted backend, set the key and the tool warns you (and, under `clean`,
+asks) before any mail leaves the machine:
+
+```bash
+EMAIL_CLEANER_AI_BACKEND=openai
+EMAIL_CLEANER_AI_API_KEY=sk-...
+email-cleaner scan --ai --ai-prompt "junk, but not receipts"
+```
+
+### AI settings
+
+Same pattern as the rest of the tool: environment variable (or `.env`) as the
+default, a CLI flag to override per run. Nothing here is required unless you
+opt in with `--ai`.
+
+| Variable | Flag | What it is |
+| --- | --- | --- |
+| `EMAIL_CLEANER_AI_BACKEND` | `--ai-backend` | `ollama`, `openai`, or `anthropic`. Unset means the feature is off. |
+| `EMAIL_CLEANER_AI_PROMPT` | `--ai-prompt` | The plain-language rule for what to delete. |
+| `EMAIL_CLEANER_AI_MODEL` | `--ai-model` | Model id (e.g. `llama3.1`, `gpt-4o-mini`, `claude-haiku-4-5`). Defaults per backend. |
+| `EMAIL_CLEANER_AI_API_KEY` | - | Key for the hosted backends. Required for `openai` / `anthropic`. |
+| `EMAIL_CLEANER_AI_HOST` | - | Base URL, for a custom or self-hosted endpoint. Defaults per backend. |
+| - | `--ai-explain` | Show the model's one-line reason for each match it keeps for deletion. |
+| - | `--ai-snippet` | Also send a short slice of each message body to the model (see below). |
+
+By default only the sender, subject, and whether a message carries an
+unsubscribe header are sent - never the body. `--ai-snippet` additionally sends a
+short, bounded slice of each message's first body part (a few hundred
+characters, never the whole body, never attachments) for better judgment. It is
+the one place the tool looks past headers, so it is behind its own flag.
+
+Cost, for hosted backends: the model only ever runs on the already-filtered
+candidate set (the promos that matched), not your whole mailbox, and the
+messages are batched. Use `--limit` to cap it while you are dialling in a prompt.
+
 ## Recipes
 
 Concrete tasks, copy-paste ready. Swap `clean` for `scan` first to preview any
@@ -312,6 +403,9 @@ email-cleaner clean --limit 100
 
 # Search beyond the inbox
 email-cleaner clean --folder "[Gmail]/All Mail" --from oldnavy.com
+
+# Let a local model decide keep-or-delete, previewing its reasons first
+email-cleaner scan --ai --ai-explain --ai-prompt "newsletters and deals, but keep receipts"
 
 # Export unsubscribe links for your noisiest senders to a file
 email-cleaner unsubscribe --output links.txt
@@ -374,6 +468,15 @@ give the account an app password you can revoke independently.
 - Nothing you clean is logged or written to disk. The tool keeps no history of
   what it touched. The single exception is `unsubscribe --output`, which writes
   the file you explicitly ask for.
+- The optional AI pass (`--ai`) is the one feature that can send mail off your
+  machine, and only with a *hosted* backend. A local Ollama backend sends
+  nothing anywhere. A hosted backend (`openai` / `anthropic`) sends the sender,
+  subject, and unsubscribe flag of each *matching* message - and a short body
+  snippet only if you pass `--ai-snippet` - to that provider for classification.
+  The tool prints a warning naming the provider before any of that leaves, and
+  under `clean` it asks you to confirm (respecting `--yes`). It never sends your
+  app password, full message bodies, or attachments, and it never persists
+  prompts or responses. When the backend is unset, none of this applies.
 
 See [SECURITY.md](SECURITY.md) for the full security model and how to report a
 problem.

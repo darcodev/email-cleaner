@@ -3,6 +3,7 @@
 Run with:  python -m unittest discover -s tests -v
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -10,10 +11,20 @@ from datetime import datetime
 from pathlib import Path
 
 from email_cleaner import config
+from email_cleaner.ai import (
+    AISettings,
+    Classifier,
+    Verdict,
+    _BackendError,
+    _loads_lenient,
+    _parse_verdicts,
+)
 from email_cleaner.errors import CleanerError
 from email_cleaner.imap_client import (
     EmailSummary,
+    _clean_snippet,
     _parse_fetch_response,
+    _parse_snippet_response,
     decode_mime_header,
     extract_unsubscribe_urls,
     quote_imap_string,
@@ -21,6 +32,7 @@ from email_cleaner.imap_client import (
 from email_cleaner.providers import get_provider, guess_provider
 from email_cleaner.scanner import (
     Filters,
+    _apply_ai,
     _apply_limit,
     build_gmail_query,
     build_standard_criteria,
@@ -30,6 +42,20 @@ from email_cleaner.scanner import (
     summarize_senders,
 )
 from email_cleaner.ui import human_size, truncate
+
+
+def _mail(uid, sender="Shop <deals@shop.com>", subject="Sale!", unsub=None):
+    name, _, addr = sender.partition(" <")
+    return EmailSummary(
+        uid=uid,
+        sender_name=name,
+        sender_email=addr.rstrip(">") or name,
+        subject=subject,
+        date="2026-01-01",
+        size=100,
+        flagged=False,
+        unsubscribe=unsub or [],
+    )
 
 
 class TestParseAge(unittest.TestCase):
@@ -386,6 +412,305 @@ class TestResolveAccount(unittest.TestCase):
         os.environ["EMAIL_CLEANER_PORT"] = "not-a-number"
         with self.assertRaises(CleanerError):
             config.resolve_account(self._args())
+
+
+def _settings(backend="ollama", **over):
+    base = dict(
+        backend=backend,
+        model="m",
+        host={"ollama": "http://localhost:11434",
+              "openai": "https://api.openai.com/v1",
+              "anthropic": "https://api.anthropic.com"}[backend],
+        api_key="k" if backend != "ollama" else None,
+        prompt="delete marketing, keep receipts",
+        snippet=False,
+    )
+    base.update(over)
+    return AISettings(**base)
+
+
+class TestAiSettings(unittest.TestCase):
+    def test_ollama_is_local(self):
+        s = _settings("ollama")
+        self.assertTrue(s.is_local)
+        self.assertFalse(s.is_hosted)
+
+    def test_hosted_backends_leave_the_machine(self):
+        self.assertTrue(_settings("openai").is_hosted)
+        self.assertTrue(_settings("anthropic").is_hosted)
+
+    def test_provider_host_is_just_the_hostname(self):
+        self.assertEqual(_settings("anthropic").provider_host, "api.anthropic.com")
+        self.assertEqual(_settings("openai").provider_host, "api.openai.com")
+
+    def test_openai_pointed_at_localhost_counts_as_local(self):
+        # someone using ollama's openai-compatible endpoint sends nothing off-box
+        s = _settings("openai", host="http://localhost:11434/v1")
+        self.assertTrue(s.is_local)
+
+
+class TestLenientJson(unittest.TestCase):
+    def test_plain_object(self):
+        self.assertEqual(_loads_lenient('{"a": 1}'), {"a": 1})
+
+    def test_wrapped_in_prose_and_fences(self):
+        raw = 'Sure!\n```json\n{"results": []}\n```\nHope that helps'
+        self.assertEqual(_loads_lenient(raw), {"results": []})
+
+    def test_bare_array(self):
+        self.assertEqual(_loads_lenient("[1, 2, 3]"), [1, 2, 3])
+
+    def test_garbage_is_none(self):
+        self.assertIsNone(_loads_lenient("not json at all"))
+        self.assertIsNone(_loads_lenient(""))
+
+
+class TestParseVerdicts(unittest.TestCase):
+    def setUp(self):
+        self.batch = [_mail("1"), _mail("2"), _mail("3")]
+
+    def test_object_with_results(self):
+        raw = json.dumps({"results": [
+            {"uid": "1", "action": "delete", "reason": "promo"},
+            {"uid": "2", "action": "keep", "reason": "receipt"},
+        ]})
+        out = _parse_verdicts(raw, self.batch)
+        self.assertTrue(out["1"].delete)
+        self.assertEqual(out["1"].reason, "promo")
+        self.assertFalse(out["2"].delete)
+        # uid 3 was not in the reply, so it is absent -> defaults to keep upstream
+        self.assertNotIn("3", out)
+
+    def test_bare_array_is_accepted(self):
+        raw = json.dumps([{"uid": "1", "action": "delete"}])
+        self.assertTrue(_parse_verdicts(raw, self.batch)["1"].delete)
+
+    def test_only_delete_deletes(self):
+        raw = json.dumps({"results": [
+            {"uid": "1", "action": "DELETE"},   # case-insensitive
+            {"uid": "2", "action": "remove"},   # anything else keeps
+        ]})
+        out = _parse_verdicts(raw, self.batch)
+        self.assertTrue(out["1"].delete)
+        self.assertFalse(out["2"].delete)
+
+    def test_unknown_uid_is_ignored(self):
+        raw = json.dumps({"results": [{"uid": "999", "action": "delete"}]})
+        self.assertEqual(_parse_verdicts(raw, self.batch), {})
+
+    def test_malformed_reply_defaults_to_empty(self):
+        # empty means every message keeps - the fail-safe
+        self.assertEqual(_parse_verdicts("total nonsense", self.batch), {})
+        self.assertEqual(_parse_verdicts('{"results": "oops"}', self.batch), {})
+
+
+class TestClassifierRequests(unittest.TestCase):
+    def _batch(self):
+        return [_mail("1", subject="40% off"), _mail("2", subject="Your receipt")]
+
+    def test_ollama_request(self):
+        clf = Classifier(_settings("ollama"))
+        url, headers, body = clf._build_request(self._batch(), {})
+        self.assertEqual(url, "http://localhost:11434/api/chat")
+        self.assertEqual(body["format"], "json")
+        self.assertNotIn("Authorization", headers)
+        self.assertIn("delete marketing", body["messages"][0]["content"])
+
+    def test_openai_request_has_bearer_auth(self):
+        clf = Classifier(_settings("openai", api_key="sk-abc"))
+        url, headers, body = clf._build_request(self._batch(), {})
+        self.assertEqual(url, "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer sk-abc")
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+
+    def test_anthropic_request_uses_x_api_key(self):
+        clf = Classifier(_settings("anthropic", api_key="ant-1", model="claude-haiku-4-5"))
+        url, headers, body = clf._build_request(self._batch(), {})
+        self.assertEqual(url, "https://api.anthropic.com/v1/messages")
+        self.assertEqual(headers["x-api-key"], "ant-1")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertEqual(body["model"], "claude-haiku-4-5")
+        self.assertIn("max_tokens", body)
+
+    def test_snippet_is_included_in_the_prompt(self):
+        clf = Classifier(_settings("ollama", snippet=True))
+        _, _, body = clf._build_request(self._batch(), {"1": "limited time only"})
+        self.assertIn("limited time only", body["messages"][1]["content"])
+
+
+class TestClassifierClassify(unittest.TestCase):
+    def _emails(self, n):
+        return [_mail(str(i)) for i in range(n)]
+
+    def test_batches_cover_every_message(self):
+        clf = Classifier(_settings("ollama"), batch_size=10)
+        seen_sizes = []
+
+        def fake_call(batch, snippets):
+            seen_sizes.append(len(batch))
+            return json.dumps({"results": [
+                {"uid": e.uid, "action": "delete", "reason": "x"} for e in batch
+            ]})
+
+        clf._call = fake_call
+        out = clf.classify(self._emails(25))
+        self.assertEqual(seen_sizes, [10, 10, 5])
+        self.assertEqual(len(out), 25)
+        self.assertTrue(all(v.delete for v in out.values()))
+
+    def test_progress_reports_totals(self):
+        clf = Classifier(_settings("ollama"), batch_size=10)
+        clf._call = lambda batch, snippets: json.dumps({"results": []})
+        seen = []
+        clf.classify(self._emails(25), on_progress=lambda d, t: seen.append((d, t)))
+        self.assertEqual(seen, [(10, 25), (20, 25), (25, 25)])
+
+    def test_transport_failure_keeps_everything(self):
+        clf = Classifier(_settings("openai", api_key="k"), batch_size=10)
+
+        def boom(batch, snippets):
+            raise _BackendError("connection refused")
+
+        clf._call = boom
+        out = clf.classify(self._emails(15))
+        # empty verdicts means every message defaults to keep upstream
+        self.assertEqual(out, {})
+        self.assertIsNotNone(clf.transport_error)
+        self.assertIn("openai", clf.transport_error)
+
+    def test_one_bad_batch_does_not_sink_the_others(self):
+        clf = Classifier(_settings("ollama"), batch_size=10)
+        calls = {"n": 0}
+
+        def flaky(batch, snippets):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _BackendError("timed out")
+            return json.dumps({"results": [
+                {"uid": e.uid, "action": "delete"} for e in batch
+            ]})
+
+        clf._call = flaky
+        out = clf.classify(self._emails(15))  # 10 then 5
+        # first batch failed (kept), second batch classified
+        self.assertEqual(len(out), 5)
+
+
+class TestApplyAi(unittest.TestCase):
+    """scanner._apply_ai narrows the candidate set with the model's verdicts."""
+
+    class _FakeClassifier:
+        wants_snippet = False
+
+        def __init__(self, verdicts):
+            self._verdicts = verdicts
+
+        def classify(self, candidates, snippets=None, on_progress=None):
+            return self._verdicts
+
+    def test_keeps_only_delete_verdicts(self):
+        cands = [_mail("1"), _mail("2"), _mail("3")]
+        clf = self._FakeClassifier({
+            "1": Verdict(delete=True, reason="promo"),
+            "2": Verdict(delete=False),
+            # 3 missing -> unknown -> keep in mailbox
+        })
+        to_clean, skipped, reasons = _apply_ai(cands, clf, {}, None)
+        self.assertEqual([e.uid for e in to_clean], ["1"])
+        self.assertEqual(skipped, 2)
+        self.assertEqual(reasons, {"1": "promo"})
+
+    def test_empty_verdicts_delete_nothing(self):
+        # models the fail-safe: an unreachable backend hands back {} and no
+        # message is ever queued for deletion
+        cands = [_mail("1"), _mail("2")]
+        clf = self._FakeClassifier({})
+        to_clean, skipped, reasons = _apply_ai(cands, clf, {}, None)
+        self.assertEqual(to_clean, [])
+        self.assertEqual(skipped, 2)
+        self.assertEqual(reasons, {})
+
+
+class TestSnippets(unittest.TestCase):
+    def test_clean_strips_tags_and_collapses_whitespace(self):
+        self.assertEqual(_clean_snippet(b"<p>Hello   world</p>\n"), "Hello world")
+
+    def test_clean_handles_empty(self):
+        self.assertEqual(_clean_snippet(b""), "")
+
+    def test_parse_snippet_response(self):
+        data = [
+            (b"1 (UID 42 BODY[1]<0> {5}", b"hi yo"),
+            b")",
+        ]
+        self.assertEqual(_parse_snippet_response(data), {"42": "hi yo"})
+
+
+class TestResolveAiSettings(unittest.TestCase):
+    KEYS = ("EMAIL_CLEANER_AI_BACKEND", "EMAIL_CLEANER_AI_MODEL",
+            "EMAIL_CLEANER_AI_API_KEY", "EMAIL_CLEANER_AI_HOST",
+            "EMAIL_CLEANER_AI_PROMPT")
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self.KEYS}
+        for k in self.KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _args(self, **over):
+        blank = dict(ai=True, ai_backend="ollama", ai_model=None,
+                     ai_prompt="junk", ai_snippet=False)
+        blank.update(over)
+        return type("Args", (), blank)()
+
+    def test_off_when_ai_flag_absent(self):
+        self.assertIsNone(config.resolve_ai_settings(self._args(ai=False)))
+
+    def test_no_backend_raises(self):
+        with self.assertRaises(CleanerError):
+            config.resolve_ai_settings(self._args(ai_backend=None))
+
+    def test_unknown_backend_raises(self):
+        with self.assertRaises(CleanerError):
+            config.resolve_ai_settings(self._args(ai_backend="frobnicate"))
+
+    def test_no_prompt_raises(self):
+        with self.assertRaises(CleanerError):
+            config.resolve_ai_settings(self._args(ai_prompt=None))
+
+    def test_hosted_backend_needs_key(self):
+        with self.assertRaises(CleanerError):
+            config.resolve_ai_settings(self._args(ai_backend="openai"))
+
+    def test_ollama_defaults_resolve(self):
+        s = config.resolve_ai_settings(self._args())
+        self.assertEqual(s.backend, "ollama")
+        self.assertEqual(s.model, "llama3.1")
+        self.assertEqual(s.host, "http://localhost:11434")
+        self.assertTrue(s.is_local)
+
+    def test_flag_overrides_model(self):
+        s = config.resolve_ai_settings(self._args(ai_model="mistral"))
+        self.assertEqual(s.model, "mistral")
+
+    def test_env_supplies_prompt_when_flag_absent(self):
+        os.environ["EMAIL_CLEANER_AI_PROMPT"] = "kill the newsletters"
+        s = config.resolve_ai_settings(self._args(ai_prompt=None))
+        self.assertEqual(s.prompt, "kill the newsletters")
+
+    def test_hosted_backend_with_key_resolves(self):
+        os.environ["EMAIL_CLEANER_AI_API_KEY"] = "sk-xyz"
+        s = config.resolve_ai_settings(self._args(ai_backend="anthropic"))
+        self.assertEqual(s.backend, "anthropic")
+        self.assertEqual(s.model, "claude-haiku-4-5")
+        self.assertEqual(s.api_key, "sk-xyz")
+        self.assertTrue(s.is_hosted)
 
 
 if __name__ == "__main__":

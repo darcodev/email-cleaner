@@ -30,6 +30,12 @@ _UID_RE = re.compile(rb"UID (\d+)")
 _SIZE_RE = re.compile(rb"RFC822\.SIZE (\d+)")
 _FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
 _UNSUB_URL_RE = re.compile(r"<([^>]+)>")
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+# How many octets of the first body part we ask for when snippets are enabled.
+# A short slice is enough for the model and keeps this far from "download bodies".
+SNIPPET_OCTETS = 400
 
 
 @dataclass
@@ -129,6 +135,34 @@ def _parse_fetch_response(data: list) -> list[EmailSummary]:
             )
         )
     return summaries
+
+
+def _clean_snippet(raw: bytes) -> str:
+    """Turn a raw body slice into a short, readable one-liner. Best effort: we
+    do not fetch the part's transfer-encoding, so this strips obvious HTML tags
+    and collapses whitespace rather than fully decoding the body."""
+    text = (raw or b"").decode("utf-8", errors="replace")
+    text = _TAG_RE.sub(" ", text)
+    text = _WS_RE.sub(" ", text).strip()
+    return text[:SNIPPET_OCTETS]
+
+
+def _parse_snippet_response(data: list) -> dict[str, str]:
+    """Map uid -> cleaned snippet from a partial-body FETCH response."""
+    out: dict[str, str] = {}
+    for item in data:
+        if not (isinstance(item, tuple) and len(item) >= 2):
+            continue
+        meta, body_bytes = item[0], item[1]
+        if not isinstance(meta, bytes):
+            continue
+        uid_m = _UID_RE.search(meta)
+        if not uid_m:
+            continue
+        snippet = _clean_snippet(body_bytes if isinstance(body_bytes, bytes) else b"")
+        if snippet:
+            out[uid_m.group(1).decode()] = snippet
+    return out
 
 
 def _chunks(items: list[str], size: int) -> Iterable[list[str]]:
@@ -258,6 +292,28 @@ class ImapSession:
             if on_progress:
                 on_progress(min(done, len(uids)), len(uids))
         return summaries
+
+    def fetch_snippets(
+        self, uids: list[str], on_progress: Callable[[int, int], None] | None = None
+    ) -> dict[str, str]:
+        """Fetch a short plain-text slice of each message's first body part.
+
+        Only used for the opt-in --ai-snippet path. This is the one place we
+        look past headers, and even then only at a bounded slice (never the
+        whole body, never attachments). Anything that fails to fetch or parse is
+        simply absent from the result, so classification falls back to headers.
+        """
+        snippets: dict[str, str] = {}
+        done = 0
+        part = f"(UID BODY.PEEK[1]<0.{SNIPPET_OCTETS}>)"
+        for batch in _chunks(uids, FETCH_BATCH):
+            typ, data = self._conn().uid("FETCH", ",".join(batch), part)
+            if typ == "OK":
+                snippets.update(_parse_snippet_response(data))
+            done += len(batch)
+            if on_progress:
+                on_progress(min(done, len(uids)), len(uids))
+        return snippets
 
     def find_trash_folder(self, hint: str | None = None) -> str:
         """Find the Trash folder: preset hint, then the \\Trash flag, then guesses."""

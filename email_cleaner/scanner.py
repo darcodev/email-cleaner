@@ -141,6 +141,9 @@ class ScanResult:
     query_description: str
     skipped_protected: int = 0
     skipped_starred: int = 0
+    skipped_ai: int = 0
+    # uid -> the model's one-line reason, for the messages it kept for deletion
+    ai_reasons: dict[str, str] = field(default_factory=dict)
 
     @property
     def total_size(self) -> int:
@@ -155,8 +158,40 @@ def _apply_limit(uids: list[str], limit: int | None) -> list[str]:
     return uids[: max(limit, 0)]
 
 
-def scan(session: ImapSession, filters: Filters, on_progress=None) -> ScanResult:
-    """Search the selected folder and return everything that matched."""
+def _apply_ai(candidates, classifier, snippets, on_progress):
+    """Narrow the candidate set with the model's keep-or-delete verdicts.
+
+    Kept for deletion only when the model explicitly said delete; a keep, an
+    unknown uid, or a failed batch (empty verdicts) all default to keep-in-
+    mailbox. Returns (to_clean, skipped_count, {uid: reason})."""
+    verdicts = classifier.classify(candidates, snippets=snippets, on_progress=on_progress)
+    to_clean: list[EmailSummary] = []
+    reasons: dict[str, str] = {}
+    skipped = 0
+    for s in candidates:
+        v = verdicts.get(s.uid)
+        if v is not None and v.delete:
+            to_clean.append(s)
+            if v.reason:
+                reasons[s.uid] = v.reason
+        else:
+            skipped += 1
+    return to_clean, skipped, reasons
+
+
+def scan(
+    session: ImapSession,
+    filters: Filters,
+    on_progress=None,
+    classifier=None,
+    on_ai_progress=None,
+) -> ScanResult:
+    """Search the selected folder and return everything that matched.
+
+    When a classifier is given, an AI keep-or-delete pass runs after the normal
+    safety net (protected/starred), so only the already-narrowed candidates are
+    ever sent to it. The pass can only narrow the set further, never widen it.
+    """
     if session.supports_gmail_search:
         query = build_gmail_query(filters)
         if query:
@@ -191,11 +226,23 @@ def scan(session: ImapSession, filters: Filters, on_progress=None) -> ScanResult
             continue
         kept.append(s)
 
+    # AI pass runs last and only on the survivors, so protected and starred mail
+    # is never sent to it (and a hosted backend only ever sees the candidates).
+    skipped_ai = 0
+    ai_reasons: dict[str, str] = {}
+    if classifier is not None and kept:
+        snippets = {}
+        if classifier.wants_snippet:
+            snippets = session.fetch_snippets([s.uid for s in kept])
+        kept, skipped_ai, ai_reasons = _apply_ai(kept, classifier, snippets, on_ai_progress)
+
     return ScanResult(
         emails=kept,
         query_description=description,
         skipped_protected=skipped_protected,
         skipped_starred=skipped_starred,
+        skipped_ai=skipped_ai,
+        ai_reasons=ai_reasons,
     )
 
 

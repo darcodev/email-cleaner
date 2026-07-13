@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import ui
+from .ai import DEFAULT_HOSTS, DEFAULT_MODELS, VALID_BACKENDS, AISettings
 from .errors import CleanerError
 from .providers import Provider, get_provider, guess_provider
 
@@ -19,6 +20,12 @@ ENV_EMAIL = "EMAIL_CLEANER_EMAIL"
 ENV_PASSWORD = "EMAIL_CLEANER_PASSWORD"
 ENV_HOST = "EMAIL_CLEANER_HOST"
 ENV_PORT = "EMAIL_CLEANER_PORT"
+
+ENV_AI_BACKEND = "EMAIL_CLEANER_AI_BACKEND"
+ENV_AI_MODEL = "EMAIL_CLEANER_AI_MODEL"
+ENV_AI_API_KEY = "EMAIL_CLEANER_AI_API_KEY"
+ENV_AI_HOST = "EMAIL_CLEANER_AI_HOST"
+ENV_AI_PROMPT = "EMAIL_CLEANER_AI_PROMPT"
 
 
 def _find_dotenv() -> Path:
@@ -156,4 +163,65 @@ def resolve_account(args) -> Account:
         port=port,
         provider_key=provider.key if provider else "custom",
         trash_folder=trash,
+    )
+
+
+def resolve_ai_settings(args) -> AISettings | None:
+    """Resolve the optional AI classification wiring, same flags-beat-env-beat-
+    defaults order as the account. Returns None when the feature is off (no
+    --ai), so a normal run behaves exactly as it does today."""
+    if not getattr(args, "ai", False):
+        return None
+
+    load_dotenv()  # idempotent; resolve_account may already have run it
+
+    backend = (
+        getattr(args, "ai_backend", None) or os.environ.get(ENV_AI_BACKEND) or ""
+    ).strip().lower()
+    if not backend:
+        raise CleanerError(
+            "AI classification is on but no backend is set.",
+            hint=(
+                f"Set {ENV_AI_BACKEND} to one of {', '.join(VALID_BACKENDS)}, "
+                "or pass --ai-backend."
+            ),
+        )
+    if backend not in VALID_BACKENDS:
+        raise CleanerError(
+            f"Unknown AI backend '{backend}'.",
+            hint=f"Valid backends: {', '.join(VALID_BACKENDS)}.",
+        )
+
+    prompt = (
+        getattr(args, "ai_prompt", None) or os.environ.get(ENV_AI_PROMPT) or ""
+    ).strip()
+    if not prompt:
+        raise CleanerError(
+            "AI classification is on but no rule was given.",
+            hint=(
+                'Describe what to delete with --ai-prompt "..." or set '
+                f"{ENV_AI_PROMPT}."
+            ),
+        )
+
+    model = (
+        getattr(args, "ai_model", None)
+        or os.environ.get(ENV_AI_MODEL)
+        or DEFAULT_MODELS[backend]
+    )
+    host = os.environ.get(ENV_AI_HOST) or DEFAULT_HOSTS[backend]
+    api_key = os.environ.get(ENV_AI_API_KEY)
+    if backend in ("openai", "anthropic") and not api_key:
+        raise CleanerError(
+            f"The {backend} AI backend needs an API key.",
+            hint=f"Set {ENV_AI_API_KEY} in your .env - hosted backends require a key.",
+        )
+
+    return AISettings(
+        backend=backend,
+        model=model,
+        host=host,
+        api_key=api_key,
+        prompt=prompt,
+        snippet=getattr(args, "ai_snippet", False),
     )

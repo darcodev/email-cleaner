@@ -26,6 +26,27 @@ an issue.
   one you explicitly request with `unsubscribe --output`.
 - `.env` is gitignored so it cannot be committed by accident.
 
+## The AI pass and where your mail goes
+
+The optional AI classification pass (`--ai`, off by default) is the one feature
+that can send message details off your machine, so it is worth being explicit:
+
+- It is opt-in per run and does nothing unless you both pass `--ai` and configure
+  a backend (`EMAIL_CLEANER_AI_BACKEND`).
+- With the **local** `ollama` backend, nothing leaves your machine. This is the
+  recommended, privacy-preserving option.
+- With a **hosted** backend (`openai` or `anthropic`), the sender, subject, and
+  unsubscribe flag of each message that matched your filters - plus a short body
+  snippet only if you pass `--ai-snippet` - are sent to that provider over TLS
+  for classification. This is a deliberate, opt-in exception to the "your mail
+  never leaves your own IMAP server" guarantee above. The tool prints a warning
+  naming the provider before the first such request, and under `clean` requires
+  confirmation (which `--yes` may skip for automation).
+- The AI pass never sends your app password, full message bodies, or
+  attachments, and it never persists prompts or responses to disk. If the
+  backend fails or replies with junk, the affected messages default to *keep*, so
+  an AI problem can only ever result in fewer deletions.
+
 ## Use an app password, not your real password
 
 Always give the tool a provider "app password" (or app-specific password), never

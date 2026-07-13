@@ -13,6 +13,7 @@ import sys
 import time
 
 from . import __version__, config, ui
+from .ai import Classifier
 from .errors import CleanerError
 from .imap_client import ImapSession
 from .scanner import (
@@ -37,6 +38,7 @@ examples:
   email-cleaner clean --protect amazon.com --protect boss@work.com
   email-cleaner clean --empty-trash        move to Trash, then empty Trash (permanent)
   email-cleaner unsubscribe                unsubscribe links for the noisiest senders
+  email-cleaner scan --ai --ai-prompt "marketing, but keep orders and receipts"
 
 setup:
   set EMAIL_CLEANER_EMAIL and EMAIL_CLEANER_PASSWORD in your environment.
@@ -114,6 +116,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     filters.add_argument("--limit", type=int, help="stop after this many matches")
     filters.add_argument("--folder", default="INBOX", help="folder to search (default: INBOX)")
+
+    ai = common.add_argument_group(
+        "AI classification (optional, opt-in; needs a backend and a rule)"
+    )
+    ai.add_argument(
+        "--ai",
+        action="store_true",
+        help="run an AI keep/delete pass over the matches (only ever narrows them)",
+    )
+    ai.add_argument(
+        "--ai-prompt",
+        metavar="RULE",
+        help='plain-language rule for what to delete, e.g. "newsletters but keep receipts"',
+    )
+    ai.add_argument(
+        "--ai-backend",
+        help="ollama, openai or anthropic (overrides EMAIL_CLEANER_AI_BACKEND)",
+    )
+    ai.add_argument("--ai-model", help="model id (overrides EMAIL_CLEANER_AI_MODEL)")
+    ai.add_argument(
+        "--ai-explain",
+        action="store_true",
+        help="show the model's one-line reason for each match it keeps for deletion",
+    )
+    ai.add_argument(
+        "--ai-snippet",
+        action="store_true",
+        help="also send a short body snippet to the model (fetches a slice of the body)",
+    )
     common.add_argument("--no-color", action="store_true", help="disable colored output")
 
     sub = parser.add_subparsers(dest="command")
@@ -156,18 +187,53 @@ def _make_filters(args) -> Filters:
     )
 
 
-def _run_scan(session: ImapSession, args, filters: Filters):
+def _build_classifier(args) -> Classifier | None:
+    """Resolve the AI settings and build a classifier, or None when --ai is off."""
+    settings = config.resolve_ai_settings(args)
+    return Classifier(settings) if settings is not None else None
+
+
+def _confirm_hosted_ai(classifier, args, allow_confirm: bool) -> bool:
+    """Warn before any mail leaves the machine for a hosted backend, and (for
+    clean) confirm it. Returns False only if the user declines. Local backends
+    like Ollama send nothing off-box, so they need neither warning nor prompt."""
+    if classifier is None or not classifier.settings.is_hosted:
+        return True
+    extra = " and a short body snippet" if classifier.settings.snippet else ""
+    ui.warn(
+        f"AI backend is {classifier.settings.provider_host}. The sender and "
+        f"subject{extra} of each matching message will be sent there for "
+        "classification."
+    )
+    if allow_confirm and not getattr(args, "yes", False):
+        if not ui.confirm("Send those details to classify them?"):
+            return False
+    return True
+
+
+def _run_scan(session: ImapSession, args, filters: Filters, classifier=None):
     ui.info(f"Searching '{args.folder}' ...")
-    result = scan(session, filters, on_progress=lambda d, t: ui.progress(d, t, "Reading headers"))
+    result = scan(
+        session,
+        filters,
+        on_progress=lambda d, t: ui.progress(d, t, "Reading headers"),
+        classifier=classifier,
+        on_ai_progress=lambda d, t: ui.progress(d, t, "Classifying"),
+    )
     if result.skipped_protected or result.skipped_starred:
         ui.info(
             f"Skipped {result.skipped_protected} protected and "
             f"{result.skipped_starred} starred message(s)."
         )
+    if classifier is not None:
+        if result.skipped_ai:
+            ui.info(f"AI kept {result.skipped_ai} message(s) it judged not a match.")
+        if classifier.transport_error:
+            ui.warn(f"{classifier.transport_error}; those messages were kept.")
     return result
 
 
-def _show_report(result, preview_rows: int = 15) -> None:
+def _show_report(result, preview_rows: int = 15, explain: bool = False) -> None:
     emails = result.emails
     if not emails:
         ui.ok("Nothing matched. Your inbox is already clean.")
@@ -181,8 +247,16 @@ def _show_report(result, preview_rows: int = 15) -> None:
     print(ui.table(["#", "Size", "Sender"], rows))
 
     ui.heading(f"Oldest matches (showing {min(preview_rows, len(emails))} of {len(emails)})")
-    rows = [[e.date, e.sender_display, e.subject] for e in emails[:preview_rows]]
-    print(ui.table(["Date", "From", "Subject"], rows))
+    if explain and result.ai_reasons:
+        headers = ["Date", "From", "Subject", "Why (AI)"]
+        rows = [
+            [e.date, e.sender_display, e.subject, result.ai_reasons.get(e.uid, "")]
+            for e in emails[:preview_rows]
+        ]
+    else:
+        headers = ["Date", "From", "Subject"]
+        rows = [[e.date, e.sender_display, e.subject] for e in emails[:preview_rows]]
+    print(ui.table(headers, rows))
 
     print()
     ui.info(
@@ -194,11 +268,14 @@ def _show_report(result, preview_rows: int = 15) -> None:
 def cmd_scan(args) -> int:
     account = config.resolve_account(args)
     filters = _make_filters(args)
+    classifier = _build_classifier(args)
+    # scan is read-only, but a hosted backend still sends data off-box, so warn
+    _confirm_hosted_ai(classifier, args, allow_confirm=False)
     with ImapSession(account.host, account.port, account.address, account.password) as session:
         ui.ok(f"Connected to {account.host} as {account.address}")
         session.select(args.folder, readonly=True)
-        result = _run_scan(session, args, filters)
-    _show_report(result)
+        result = _run_scan(session, args, filters, classifier)
+    _show_report(result, explain=args.ai_explain)
     if result.emails:
         print()
         ui.info("This was a preview, nothing was changed.")
@@ -209,13 +286,19 @@ def cmd_scan(args) -> int:
 def cmd_clean(args) -> int:
     account = config.resolve_account(args)
     filters = _make_filters(args)
+    classifier = _build_classifier(args)
+    # for a hosted backend, confirm before any mail leaves the machine - this
+    # has to happen before the scan, which is where the classification runs
+    if not _confirm_hosted_ai(classifier, args, allow_confirm=True):
+        ui.info("Cancelled, nothing was changed.")
+        return 1
     started = time.monotonic()
 
     with ImapSession(account.host, account.port, account.address, account.password) as session:
         ui.ok(f"Connected to {account.host} as {account.address}")
         session.select(args.folder, readonly=False)
-        result = _run_scan(session, args, filters)
-        _show_report(result)
+        result = _run_scan(session, args, filters, classifier)
+        _show_report(result, explain=args.ai_explain)
         if not result.emails:
             return 0
 
