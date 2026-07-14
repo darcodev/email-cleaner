@@ -84,7 +84,7 @@ pip install git+https://github.com/darcodev/email-cleaner.git
 To pin a specific released version, add the tag:
 
 ```bash
-pipx install "git+https://github.com/darcodev/email-cleaner.git@v0.3.0"
+pipx install "git+https://github.com/darcodev/email-cleaner.git@v0.4.0"
 ```
 
 Prefer to work from a clone?

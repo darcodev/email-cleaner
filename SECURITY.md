@@ -11,8 +11,8 @@ an issue.
 
 | Version | Supported |
 | --- | --- |
-| 0.3.x | Yes |
-| < 0.3 | No |
+| 0.4.x | Yes |
+| < 0.4 | No |
 
 ## How your credentials are handled
 
