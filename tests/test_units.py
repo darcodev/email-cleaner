@@ -460,6 +460,16 @@ class TestLenientJson(unittest.TestCase):
     def test_bare_array(self):
         self.assertEqual(_loads_lenient("[1, 2, 3]"), [1, 2, 3])
 
+    def test_wrapped_single_element_array_is_not_grabbed_as_its_object(self):
+        # a fenced one-item array must parse as the LIST, not its inner object,
+        # or _parse_verdicts drops the verdict and the message is wrongly kept
+        raw = 'Here:\n```json\n[{"uid": "1", "action": "delete"}]\n```'
+        self.assertEqual(_loads_lenient(raw), [{"uid": "1", "action": "delete"}])
+
+    def test_wrapped_object_still_wins_when_it_starts_first(self):
+        raw = 'Sure:\n```json\n{"results": [{"uid": "1"}]}\n```'
+        self.assertEqual(_loads_lenient(raw), {"results": [{"uid": "1"}]})
+
     def test_garbage_is_none(self):
         self.assertIsNone(_loads_lenient("not json at all"))
         self.assertIsNone(_loads_lenient(""))
@@ -484,6 +494,15 @@ class TestParseVerdicts(unittest.TestCase):
     def test_bare_array_is_accepted(self):
         raw = json.dumps([{"uid": "1", "action": "delete"}])
         self.assertTrue(_parse_verdicts(raw, self.batch)["1"].delete)
+
+    def test_fenced_single_element_array_verdict_survives(self):
+        # regression: a prose/fence-wrapped one-item array used to be misparsed
+        # as its inner object, silently dropping the verdict (message kept)
+        raw = 'Result:\n```json\n[{"uid": "1", "action": "delete", "reason": "promo"}]\n```'
+        out = _parse_verdicts(raw, self.batch)
+        self.assertIn("1", out)
+        self.assertTrue(out["1"].delete)
+        self.assertEqual(out["1"].reason, "promo")
 
     def test_only_delete_deletes(self):
         raw = json.dumps({"results": [

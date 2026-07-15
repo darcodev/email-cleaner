@@ -123,14 +123,21 @@ def _loads_lenient(raw: str):
         return json.loads(raw)
     except (ValueError, TypeError):
         pass
+    # Models sometimes wrap the JSON in prose or ``` fences. Build the widest
+    # span for each bracket type and try the earliest-starting one first, so a
+    # wrapped array like [ {..} ] is not mistaken for its first { .. } element
+    # (which would then miss the "results" key and drop every verdict).
+    spans = []
     for opener, closer in (("{", "}"), ("[", "]")):
         start = raw.find(opener)
         end = raw.rfind(closer)
         if start != -1 and end > start:
-            try:
-                return json.loads(raw[start : end + 1])
-            except (ValueError, TypeError):
-                continue
+            spans.append((start, raw[start : end + 1]))
+    for _, span in sorted(spans):
+        try:
+            return json.loads(span)
+        except (ValueError, TypeError):
+            continue
     return None
 
 
