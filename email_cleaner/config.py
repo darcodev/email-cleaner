@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from . import ui
 from .ai import DEFAULT_HOSTS, DEFAULT_MODELS, VALID_BACKENDS, AISettings
@@ -209,7 +210,21 @@ def resolve_ai_settings(args) -> AISettings | None:
         or os.environ.get(ENV_AI_MODEL)
         or DEFAULT_MODELS[backend]
     )
-    host = os.environ.get(ENV_AI_HOST) or DEFAULT_HOSTS[backend]
+    host = (os.environ.get(ENV_AI_HOST) or "").strip() or DEFAULT_HOSTS[backend]
+    # a host without a scheme ('api.openai.com/v1') parses to no hostname at
+    # all, which used to read as "local" - no privacy warning, no consent
+    # prompt - and then died on an unknown-url-type traceback mid-scan. Catch
+    # it here, while it is still something the user can fix.
+    parsed = urlparse(host)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise CleanerError(
+            f"AI host '{host}' is not a base URL.",
+            hint=(
+                f"{ENV_AI_HOST} needs the scheme too, e.g. "
+                "http://localhost:11434 or https://api.openai.com/v1."
+            ),
+        )
+
     api_key = os.environ.get(ENV_AI_API_KEY)
     if backend in ("openai", "anthropic") and not api_key:
         raise CleanerError(

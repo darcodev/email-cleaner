@@ -356,6 +356,7 @@ def cmd_clean(args) -> int:
                     )
                 else:
                     ui.info("Left the Trash as-is.")
+        expunge_notice = session.expunge_notice
 
     elapsed = time.monotonic() - started
     print()
@@ -363,6 +364,8 @@ def cmd_clean(args) -> int:
         f"{done} emails {action}, reclaimed ~{ui.human_size(result.total_size)} "
         f"in {elapsed:.1f}s."
     )
+    if expunge_notice:
+        ui.warn(expunge_notice)
     if emptied is not None:
         ui.ok(f"Trash emptied: {emptied} message(s) permanently deleted.")
     return 0

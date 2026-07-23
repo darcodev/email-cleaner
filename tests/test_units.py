@@ -22,12 +22,16 @@ from email_cleaner.ai import (
 from email_cleaner.errors import CleanerError
 from email_cleaner.imap_client import (
     EmailSummary,
+    ImapSession,
     _clean_snippet,
     _parse_fetch_response,
     _parse_snippet_response,
     decode_mime_header,
+    encode_mailbox_name,
     extract_unsubscribe_urls,
     quote_imap_string,
+    quoted_mailbox,
+    search_args,
 )
 from email_cleaner.providers import get_provider, guess_provider
 from email_cleaner.scanner import (
@@ -282,6 +286,124 @@ class TestImapHelpers(unittest.TestCase):
         self.assertTrue(summary.flagged)
 
 
+class _FakeConn:
+    """Records the commands an ImapSession issues, so the delete and search
+    paths can be checked without a server."""
+
+    def __init__(self, fail_on=()):
+        self.calls = []
+        self.fail_on = fail_on
+
+    def uid(self, command, *args):
+        self.calls.append((command, *args))
+        if command in self.fail_on:
+            return "NO", [b"server said no"]
+        return "OK", [None]
+
+    def expunge(self):
+        self.calls.append(("EXPUNGE",))
+        return "OK", [None]
+
+
+def _fake_session(capabilities=(), fail_on=()):
+    session = ImapSession("host", 993, "me@x.com", "pw")
+    session._capabilities = {c.upper() for c in capabilities}
+    session._imap = _FakeConn(fail_on)
+    session.selected_folder = "INBOX"
+    return session, session._imap
+
+
+class TestExpungeScope(unittest.TestCase):
+    """A bare EXPUNGE purges every \\Deleted message in the open folder, not
+    just the ones we flagged, so it can destroy mail another client had marked
+    and never compacted. UID EXPUNGE keeps us to our own UIDs."""
+
+    def test_permanent_delete_names_its_own_uids(self):
+        session, conn = _fake_session(["UIDPLUS"])
+        session.delete_permanently(["1", "2"])
+        self.assertIn(("EXPUNGE", "1,2"), conn.calls)
+        self.assertNotIn(("EXPUNGE",), conn.calls)
+        self.assertIsNone(session.expunge_notice)
+
+    def test_server_without_uidplus_falls_back_and_warns(self):
+        session, conn = _fake_session()
+        session.delete_permanently(["1"])
+        self.assertIn(("EXPUNGE",), conn.calls)
+        self.assertIsNotNone(session.expunge_notice)
+
+    def test_empty_match_set_purges_nothing(self):
+        # an empty result used to still fire a folder-wide EXPUNGE
+        session, conn = _fake_session()
+        self.assertEqual(session.delete_permanently([]), 0)
+        self.assertEqual(conn.calls, [])
+
+    def test_copy_fallback_purges_only_what_it_copied(self):
+        session, conn = _fake_session(["UIDPLUS"])  # no MOVE extension
+        session.move_to_trash(["7", "8"], "Trash")
+        self.assertIn(("COPY", "7,8", '"Trash"'), conn.calls)
+        self.assertIn(("EXPUNGE", "7,8"), conn.calls)
+        self.assertNotIn(("EXPUNGE",), conn.calls)
+
+    def test_move_extension_never_expunges(self):
+        session, conn = _fake_session(["MOVE", "UIDPLUS"])
+        session.move_to_trash(["7"], "Trash")
+        self.assertEqual(conn.calls, [("MOVE", "7", '"Trash"')])
+
+    def test_failed_store_after_a_copy_raises(self):
+        # the copy already landed, so carrying on would leave it in both places
+        session, _ = _fake_session(["UIDPLUS"], fail_on=("STORE",))
+        with self.assertRaises(CleanerError):
+            session.move_to_trash(["7"], "Trash")
+
+
+class TestNonAsciiSearch(unittest.TestCase):
+    """imaplib encodes command arguments as ascii, so an accented keyword blew
+    up with UnicodeEncodeError before the search was ever sent."""
+
+    def test_ascii_criteria_are_left_alone(self):
+        self.assertEqual(search_args(["FROM", '"a@b.com"']), ["FROM", '"a@b.com"'])
+
+    def test_non_ascii_declares_utf8_and_pre_encodes(self):
+        args = search_args(["TEXT", '"café"'])
+        self.assertEqual(args[:2], ["CHARSET", "UTF-8"])
+        self.assertEqual(args[2:], [b"TEXT", '"café"'.encode("utf-8")])
+
+    def test_every_argument_survives_what_imaplib_does_to_it(self):
+        for arg in search_args(["TEXT", '"日本語"']):
+            if not isinstance(arg, bytes):
+                arg.encode("ascii")  # imaplib does this; must not raise
+
+    def test_standard_search_sends_the_charset(self):
+        session, conn = _fake_session()
+        session.search_standard(["TEXT", '"café"'])
+        self.assertEqual(conn.calls[0][:3], ("SEARCH", "CHARSET", "UTF-8"))
+
+    def test_gmail_raw_search_sends_the_charset(self):
+        session, conn = _fake_session(["X-GM-EXT-1"])
+        session.search_gmail_raw("category:promotions Grüße")
+        self.assertIn("CHARSET", conn.calls[0])
+
+
+class TestMailboxNames(unittest.TestCase):
+    def test_ascii_passes_through(self):
+        self.assertEqual(encode_mailbox_name("[Gmail]/Trash"), "[Gmail]/Trash")
+
+    def test_non_ascii_becomes_modified_utf7(self):
+        self.assertEqual(encode_mailbox_name("Gelöscht"), "Gel&APY-scht")
+
+    def test_an_already_encoded_name_is_not_encoded_twice(self):
+        # LIST hands names back in this encoding already; escaping the '&' a
+        # second time would point us at a folder that does not exist
+        self.assertEqual(
+            encode_mailbox_name("INBOX.Gel&APY-scht"), "INBOX.Gel&APY-scht"
+        )
+
+    def test_quoted_mailbox_is_ascii_safe(self):
+        quoted = quoted_mailbox("Élements supprimés")
+        quoted.encode("ascii")  # must not raise
+        self.assertEqual(quoted, '"&AMk-lements supprim&AOk-s"')
+
+
 class TestUiHelpers(unittest.TestCase):
     def test_human_size(self):
         self.assertEqual(human_size(0), "0 B")
@@ -447,6 +569,19 @@ class TestAiSettings(unittest.TestCase):
         # someone using ollama's openai-compatible endpoint sends nothing off-box
         s = _settings("openai", host="http://localhost:11434/v1")
         self.assertTrue(s.is_local)
+
+    def test_loopback_ip_counts_as_local(self):
+        self.assertTrue(_settings("ollama", host="http://127.0.0.1:11434").is_local)
+
+    def test_host_we_cannot_read_counts_as_hosted(self):
+        # 'api.openai.com/v1' has no scheme, so urlparse finds no hostname at
+        # all. Reading that as local skipped the privacy warning and the
+        # consent prompt for a very much remote endpoint.
+        self.assertTrue(_settings("openai", host="api.openai.com/v1").is_hosted)
+        self.assertTrue(_settings("ollama", host="").is_hosted)
+
+    def test_a_box_on_the_lan_is_not_this_machine(self):
+        self.assertTrue(_settings("ollama", host="http://192.168.1.5:11434").is_hosted)
 
 
 class TestLenientJson(unittest.TestCase):
@@ -722,6 +857,17 @@ class TestResolveAiSettings(unittest.TestCase):
         os.environ["EMAIL_CLEANER_AI_PROMPT"] = "kill the newsletters"
         s = config.resolve_ai_settings(self._args(ai_prompt=None))
         self.assertEqual(s.prompt, "kill the newsletters")
+
+    def test_host_without_a_scheme_is_rejected_up_front(self):
+        os.environ["EMAIL_CLEANER_AI_API_KEY"] = "sk-xyz"
+        os.environ["EMAIL_CLEANER_AI_HOST"] = "api.openai.com/v1"
+        with self.assertRaises(CleanerError):
+            config.resolve_ai_settings(self._args(ai_backend="openai"))
+
+    def test_custom_host_with_a_scheme_resolves(self):
+        os.environ["EMAIL_CLEANER_AI_HOST"] = "http://192.168.1.5:11434"
+        s = config.resolve_ai_settings(self._args())
+        self.assertEqual(s.host, "http://192.168.1.5:11434")
 
     def test_hosted_backend_with_key_resolves(self):
         os.environ["EMAIL_CLEANER_AI_API_KEY"] = "sk-xyz"

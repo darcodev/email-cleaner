@@ -256,7 +256,7 @@ matters, especially on Gmail, so here is exactly what each one does.
 | --- | --- | --- |
 | `clean` (default) | Copies the matches to your Trash folder and removes them from the inbox. | Yes, for about 30 days in Trash. |
 | `clean --empty-trash` | Does the move above, then empties your entire Trash folder. | No. Anything already in Trash is deleted too. |
-| `clean --permanent` | Marks the matches deleted in place and expunges them, skipping Trash. | No. |
+| `clean --permanent` | Marks the matches deleted in place and purges those exact messages, skipping Trash. | No. |
 
 A Gmail note: on Gmail, deleting a message from a folder in plain IMAP only
 removes that label; the message survives in "All Mail". The reliable way to
@@ -539,7 +539,11 @@ matches, and (for `clean`) move them.
   keep it quick on large mailboxes.
 - Moving to Trash uses the IMAP `MOVE` extension when the server supports it
   (Gmail does), which is a single round trip per batch; otherwise it falls back
-  to copy, mark deleted, then expunge.
+  to copy, mark deleted, then purge.
+- Purging names the exact UIDs it is removing (`UID EXPUNGE`, RFC 4315). A plain
+  `EXPUNGE` would take out every message in the folder that anything had ever
+  flagged deleted, including mail another client left in that state. On the rare
+  server without `UIDPLUS` there is no scoped option and the run says so.
 
 The source is small and split by job: `cli.py` (arguments and commands),
 `config.py` (account and `.env`), `providers.py` (provider presets),

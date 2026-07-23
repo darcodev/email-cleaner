@@ -5,6 +5,7 @@ Deleting means copy-to-Trash unless you ask for a permanent delete.
 
 from __future__ import annotations
 
+import base64
 import email
 import email.header
 import email.utils
@@ -88,6 +89,57 @@ def extract_unsubscribe_urls(header_value: str) -> list[str]:
 def quote_imap_string(value: str) -> str:
     r"""Quote a string for use in an IMAP command ('a"b' -> '"a\"b"')."""
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def encode_mailbox_name(name: str) -> str:
+    """Encode a folder name as modified UTF-7 (RFC 3501 section 5.1.3).
+
+    IMAP folder names travel as ASCII, so 'Gelöschte' has to go over the wire
+    as 'Gel&APY-schte'. An all-ASCII name is returned untouched on purpose:
+    names we got back from LIST are already in this encoding, and re-encoding
+    would turn their '&' into '&-' and point us at a folder that doesn't exist.
+    """
+    if name.isascii():
+        return name
+    out: list[str] = []
+    pending: list[str] = []
+
+    def flush() -> None:
+        if not pending:
+            return
+        raw = "".join(pending).encode("utf-16-be")
+        b64 = base64.b64encode(raw).decode("ascii").rstrip("=")
+        out.append("&" + b64.replace("/", ",") + "-")
+        pending.clear()
+
+    for ch in name:
+        if " " <= ch <= "~":  # printable ascii represents itself
+            flush()
+            out.append("&-" if ch == "&" else ch)
+        else:
+            pending.append(ch)
+    flush()
+    return "".join(out)
+
+
+def quoted_mailbox(name: str) -> str:
+    """A folder name ready to hand to imaplib: encoded, then quoted."""
+    return quote_imap_string(encode_mailbox_name(name))
+
+
+def search_args(criteria: list[str]) -> list:
+    """Prepare SEARCH arguments so non-ASCII terms survive the trip.
+
+    imaplib encodes str arguments as ASCII, so a keyword, sender or Gmail query
+    containing an accent raises UnicodeEncodeError before the command is even
+    sent. When anything needs more than ASCII we declare CHARSET UTF-8 and hand
+    imaplib pre-encoded bytes, which it appends to the command line verbatim.
+    Pure ASCII criteria are passed through unchanged so we keep talking to old
+    servers exactly as before.
+    """
+    if all(c.isascii() for c in criteria):
+        return list(criteria)
+    return ["CHARSET", "UTF-8", *(c.encode("utf-8") for c in criteria)]
 
 
 def _parse_fetch_response(data: list) -> list[EmailSummary]:
@@ -180,6 +232,10 @@ class ImapSession:
         self._password = password
         self._imap: imaplib.IMAP4_SSL | None = None
         self._capabilities: set[str] = set()
+        self.selected_folder: str | None = None
+        # set when the purge could not be scoped to our own UIDs; the CLI reads
+        # it after the run so the user hears what else it may have taken out
+        self.expunge_notice: str | None = None
 
     def connect(self) -> None:
         try:
@@ -228,6 +284,12 @@ class ImapSession:
         # trash a batch in one round trip instead of copy + mark + expunge.
         return "MOVE" in self._capabilities
 
+    @property
+    def supports_uid_expunge(self) -> bool:
+        # RFC 4315. Without it the only way to purge is a bare EXPUNGE, which
+        # is not scoped to our messages - see _expunge below.
+        return "UIDPLUS" in self._capabilities
+
     def close(self) -> None:
         if self._imap is None:
             return
@@ -246,13 +308,14 @@ class ImapSession:
 
     def select(self, folder: str = "INBOX", readonly: bool = True) -> int:
         """Open a folder, return how many messages it holds."""
-        typ, data = self._conn().select(quote_imap_string(folder), readonly=readonly)
+        typ, data = self._conn().select(quoted_mailbox(folder), readonly=readonly)
         if typ != "OK":
             detail = (data[0] or b"").decode(errors="replace") if data else ""
             raise CleanerError(
                 f"Could not open folder '{folder}' ({detail}).",
                 hint="Use --folder to pick a folder that exists on your server.",
             )
+        self.selected_folder = folder
         try:
             return int(data[0])
         except (TypeError, ValueError):
@@ -260,18 +323,24 @@ class ImapSession:
 
     def search_gmail_raw(self, query: str) -> list[str]:
         # X-GM-RAW lets us hand Gmail its own search-box syntax
-        typ, data = self._conn().uid("SEARCH", "X-GM-RAW", quote_imap_string(query))
+        args = search_args(["X-GM-RAW", quote_imap_string(query)])
+        typ, data = self._conn().uid("SEARCH", *args)
         return self._search_result(typ, data)
 
     def search_standard(self, criteria: list[str]) -> list[str]:
-        typ, data = self._conn().uid("SEARCH", *criteria)
+        typ, data = self._conn().uid("SEARCH", *search_args(criteria))
         return self._search_result(typ, data)
 
     @staticmethod
     def _search_result(typ: str, data: list) -> list[str]:
         if typ != "OK":
             detail = (data[0] or b"").decode(errors="replace") if data else ""
-            raise CleanerError(f"Search failed ({detail}).")
+            hint = None
+            if "BADCHARSET" in detail.upper():
+                # we only ask for UTF-8 when a term needs it, so this is a
+                # server that cannot search outside ascii at all
+                hint = "This server can't search non-ASCII text; try an ASCII keyword."
+            raise CleanerError(f"Search failed ({detail}).", hint=hint)
         if not data or not data[0]:
             return []
         # UIDs come back oldest first; keep that order so --limit trims
@@ -341,13 +410,43 @@ class ImapSession:
         for name in candidates:
             if not name:
                 continue
-            typ, _ = conn.status(quote_imap_string(name), "(MESSAGES)")
+            typ, _ = conn.status(quoted_mailbox(name), "(MESSAGES)")
             if typ == "OK":
                 return name
         raise CleanerError(
             "Could not find your Trash folder.",
             hint="Pass it explicitly with --trash-folder.",
         )
+
+    def _expunge(self, uids: list[str]) -> None:
+        """Purge the messages we just flagged \\Deleted - and only those.
+
+        A bare EXPUNGE removes *every* \\Deleted message in the open folder,
+        including ones some other client flagged and never purged (Thunderbird
+        and Outlook both leave mail in that state until you compact). That mail
+        was never ours to touch and there is no Trash copy of it, so we use UID
+        EXPUNGE (RFC 4315) to name exactly our own UIDs. Servers without UIDPLUS
+        leave us no choice but the blunt version; we note that for the CLI.
+        """
+        if not uids:
+            return
+        conn = self._conn()
+        if self.supports_uid_expunge:
+            for batch in _chunks(uids, STORE_BATCH):
+                typ, _ = conn.uid("EXPUNGE", ",".join(batch))
+                if typ != "OK":
+                    # they are flagged, just still there; the next run picks
+                    # them up. Better than reporting a delete that didn't happen
+                    self.expunge_notice = (
+                        "the server refused UID EXPUNGE, so some messages are "
+                        "marked deleted but still in the folder"
+                    )
+            return
+        self.expunge_notice = (
+            "this server has no UID EXPUNGE, so any messages another mail app "
+            "had already flagged deleted in this folder were purged too"
+        )
+        conn.expunge()
 
     def move_to_trash(
         self,
@@ -363,7 +462,7 @@ class ImapSession:
         """
         conn = self._conn()
         moved = 0
-        quoted_trash = quote_imap_string(trash_folder)
+        quoted_trash = quoted_mailbox(trash_folder)
         can_move = self.supports_move
         for batch in _chunks(uids, STORE_BATCH):
             uid_set = ",".join(batch)
@@ -378,19 +477,28 @@ class ImapSession:
                     f"{moved} message(s) were moved before the error.",
                 )
             if not can_move:
-                conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                # the copy landed, so a failure here leaves the message in both
+                # places - worth stopping for rather than quietly duplicating
+                typ, _ = conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                if typ != "OK":
+                    raise CleanerError(
+                        f"Copied {len(batch)} message(s) to '{trash_folder}' but "
+                        f"could not remove them from '{self.selected_folder}', so "
+                        "they are now in both places.",
+                        hint="Delete the copies from your Trash and try again.",
+                    )
             moved += len(batch)
             if on_progress:
                 on_progress(moved, len(uids))
         if not can_move:
             # MOVE expunges as it goes; only the copy fallback needs this
-            conn.expunge()
+            self._expunge(uids)
         return moved
 
     def delete_permanently(
         self, uids: list[str], on_progress: Callable[[int, int], None] | None = None
     ) -> int:
-        """Flag messages \\Deleted and expunge. Does not pass through Trash."""
+        """Flag messages \\Deleted and purge them. Does not pass through Trash."""
         conn = self._conn()
         deleted = 0
         for batch in _chunks(uids, STORE_BATCH):
@@ -403,7 +511,7 @@ class ImapSession:
             deleted += len(batch)
             if on_progress:
                 on_progress(deleted, len(uids))
-        conn.expunge()
+        self._expunge(uids)
         return deleted
 
     def empty_trash(
@@ -430,6 +538,8 @@ class ImapSession:
             removed += len(batch)
             if on_progress:
                 on_progress(removed, len(uids))
+        # every message in the folder is flagged at this point, so the unscoped
+        # EXPUNGE is exactly what was asked for here - nothing else can be hit
         conn.expunge()
         return len(uids)
 

@@ -59,6 +59,9 @@ DEFAULT_HOSTS = {
 # ~25 short {uid, action, reason} rows fit comfortably; give generous headroom.
 _ANTHROPIC_MAX_TOKENS = 2048
 
+# Hostnames that mean "this machine", so nothing leaves it.
+LOCAL_HOSTNAMES = ("localhost", "127.0.0.1", "::1")
+
 
 @dataclass
 class Verdict:
@@ -86,9 +89,17 @@ class AISettings:
     def is_local(self) -> bool:
         """True when the backend lives on this machine, so no mail leaves it.
         Based on the host, not the backend name, so pointing the openai backend
-        at a local Ollama is correctly treated as local."""
-        host = (urlparse(self.host).hostname or "").lower()
-        return host in ("localhost", "127.0.0.1", "::1", "")
+        at a local Ollama is correctly treated as local.
+
+        A host we can't read (no scheme, so urlparse finds no hostname at all -
+        'api.openai.com/v1' parses that way) counts as remote, not local: the
+        wrong answer here silently skips the privacy warning and the consent
+        prompt, so it has to fail towards asking. config.resolve_ai_settings
+        rejects those up front; this is the backstop."""
+        hostname = urlparse(self.host).hostname
+        if not hostname:
+            return False
+        return hostname.lower() in LOCAL_HOSTNAMES
 
     @property
     def is_hosted(self) -> bool:
