@@ -431,8 +431,12 @@ def _prompt_menu(args) -> None:
     args.from_senders = _split_list(ui.prompt("Only from these senders/domains", default=""))
     args.protect = _split_list(ui.prompt("Never touch these senders", default=""))
 
+    # answering here is what lets cmd_clean skip its own gate later, so this has
+    # to be the same 'type yes in full' one the --empty-trash flag gets - a
+    # stray 'y' at a menu must not be enough to wipe the whole Trash folder
     args.empty_trash = ui.confirm(
-        "After trashing, empty the whole Trash folder too? (permanent, optional)"
+        "After trashing, empty the whole Trash folder too? (permanent, optional)",
+        danger=True,
     )
     if args.empty_trash:
         # they answered here, so we won't ask a second time when we get to it

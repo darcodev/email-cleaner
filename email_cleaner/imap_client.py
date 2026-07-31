@@ -290,12 +290,28 @@ class ImapSession:
         # is not scoped to our messages - see _expunge below.
         return "UIDPLUS" in self._capabilities
 
+    @property
+    def supports_unselect(self) -> bool:
+        # RFC 3691. Leaves the mailbox without the implicit purge CLOSE does.
+        return "UNSELECT" in self._capabilities
+
     def close(self) -> None:
+        """Hang up. Deliberately never sends IMAP CLOSE.
+
+        CLOSE looks like the polite way out, but on a writable mailbox it
+        permanently removes every \\Deleted message in it first - the same
+        unscoped purge _expunge goes out of its way to avoid. 'clean' opens the
+        folder read-write, so ending that way would quietly destroy mail another
+        client had flagged and not compacted, with no Trash copy and none of the
+        warning the bare-EXPUNGE path prints. UNSELECT (RFC 3691) is CLOSE
+        without the purge; where it isn't offered, LOGOUT from the selected
+        state ends the session just as cleanly and expunges nothing.
+        """
         if self._imap is None:
             return
         try:
-            if self._imap.state == "SELECTED":
-                self._imap.close()
+            if self._imap.state == "SELECTED" and self.supports_unselect:
+                self._imap.unselect()
             self._imap.logout()
         except Exception:
             pass

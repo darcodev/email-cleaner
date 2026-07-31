@@ -9,8 +9,9 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
-from email_cleaner import config
+from email_cleaner import cli, config
 from email_cleaner.ai import (
     AISettings,
     Classifier,
@@ -293,6 +294,7 @@ class _FakeConn:
     def __init__(self, fail_on=()):
         self.calls = []
         self.fail_on = fail_on
+        self.state = "SELECTED"
 
     def uid(self, command, *args):
         self.calls.append((command, *args))
@@ -302,6 +304,21 @@ class _FakeConn:
 
     def expunge(self):
         self.calls.append(("EXPUNGE",))
+        return "OK", [None]
+
+    def close(self):
+        self.calls.append(("CLOSE",))
+        self.state = "AUTH"
+        return "OK", [None]
+
+    def unselect(self):
+        self.calls.append(("UNSELECT",))
+        self.state = "AUTH"
+        return "OK", [None]
+
+    def logout(self):
+        self.calls.append(("LOGOUT",))
+        self.state = "LOGOUT"
         return "OK", [None]
 
 
@@ -354,6 +371,50 @@ class TestExpungeScope(unittest.TestCase):
         session, _ = _fake_session(["UIDPLUS"], fail_on=("STORE",))
         with self.assertRaises(CleanerError):
             session.move_to_trash(["7"], "Trash")
+
+
+class TestSessionTeardown(unittest.TestCase):
+    """IMAP CLOSE purges every \\Deleted message in a writable mailbox on its
+    way out - the same unscoped wipe UID EXPUNGE exists to avoid. 'clean' opens
+    the folder read-write, so hanging up that way silently destroyed mail
+    another client had flagged and never compacted."""
+
+    def test_teardown_never_sends_close(self):
+        session, conn = _fake_session(["UIDPLUS"])
+        session.close()
+        self.assertNotIn(("CLOSE",), conn.calls)
+        self.assertIn(("LOGOUT",), conn.calls)
+
+    def test_unselect_is_used_when_the_server_offers_it(self):
+        session, conn = _fake_session(["UIDPLUS", "UNSELECT"])
+        session.close()
+        self.assertEqual(conn.calls, [("UNSELECT",), ("LOGOUT",)])
+
+    def test_a_clean_run_purges_only_its_own_uids(self):
+        # end to end: flag, scoped purge, hang up - and nothing else
+        session, conn = _fake_session(["UIDPLUS", "UNSELECT"])
+        session.delete_permanently(["4", "5"])
+        session.close()
+        self.assertEqual(
+            conn.calls,
+            [
+                ("STORE", "4,5", "+FLAGS.SILENT", "(\\Deleted)"),
+                ("EXPUNGE", "4,5"),
+                ("UNSELECT",),
+                ("LOGOUT",),
+            ],
+        )
+
+    def test_teardown_is_still_safe_without_unselect(self):
+        session, conn = _fake_session()
+        session.close()
+        self.assertEqual(conn.calls, [("LOGOUT",)])
+
+    def test_closing_twice_is_a_noop(self):
+        session, conn = _fake_session(["UNSELECT"])
+        session.close()
+        session.close()
+        self.assertEqual(conn.calls.count(("LOGOUT",)), 1)
 
 
 class TestNonAsciiSearch(unittest.TestCase):
@@ -798,6 +859,44 @@ class TestSnippets(unittest.TestCase):
             b")",
         ]
         self.assertEqual(_parse_snippet_response(data), {"42": "hi yo"})
+
+
+class TestMenuEmptyTrash(unittest.TestCase):
+    """Saying yes in the menu is what makes cmd_clean skip its own confirmation,
+    so it has to be the same full-word gate the --empty-trash flag gets. A plain
+    [y/N] there meant one keystroke destroyed the entire Trash folder."""
+
+    def _run_menu(self, answers=True):
+        asked = []
+
+        def fake_confirm(question, danger=False):
+            asked.append((question, danger))
+            return answers
+
+        with mock.patch.object(cli.ui, "confirm", fake_confirm), \
+                mock.patch.object(cli.ui, "prompt", lambda q, default=None: default or ""), \
+                mock.patch.object(cli.ui, "heading", lambda *a, **k: None), \
+                mock.patch("builtins.print", lambda *a, **k: None):
+            args = cli.build_parser().parse_args(["clean"])
+            cli._prompt_menu(args)
+        return args, asked
+
+    def test_empty_trash_question_demands_the_full_word(self):
+        args, asked = self._run_menu()
+        trash = [(q, danger) for q, danger in asked if "Trash" in q]
+        self.assertTrue(trash, "the menu never asked about the Trash")
+        for question, danger in trash:
+            self.assertTrue(danger, f"not a danger prompt: {question}")
+
+    def test_yes_here_is_what_skips_the_later_gate(self):
+        args, _ = self._run_menu(answers=True)
+        self.assertTrue(args.empty_trash)
+        self.assertTrue(getattr(args, "_empty_trash_confirmed", False))
+
+    def test_no_here_leaves_the_trash_alone(self):
+        args, _ = self._run_menu(answers=False)
+        self.assertFalse(args.empty_trash)
+        self.assertFalse(getattr(args, "_empty_trash_confirmed", False))
 
 
 class TestResolveAiSettings(unittest.TestCase):
