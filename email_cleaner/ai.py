@@ -188,7 +188,11 @@ def _extract_text(backend: str, payload) -> str | None:
                 if isinstance(block, dict) and block.get("type") == "text":
                     return block.get("text", "")
             return None
-    except (KeyError, IndexError, TypeError):
+    # AttributeError matters as much as the rest: a backend that answers with a
+    # bare JSON array or string has no .get, and letting that escape would crash
+    # the run instead of failing safe. Anything unreadable here becomes a
+    # _BackendError upstream, which means keep.
+    except (KeyError, IndexError, TypeError, AttributeError):
         return None
     return None
 

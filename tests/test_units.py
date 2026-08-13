@@ -5,6 +5,7 @@ Run with:  python -m unittest discover -s tests -v
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime
@@ -17,6 +18,7 @@ from email_cleaner.ai import (
     Classifier,
     Verdict,
     _BackendError,
+    _extract_text,
     _loads_lenient,
     _parse_verdicts,
 )
@@ -46,7 +48,7 @@ from email_cleaner.scanner import (
     parse_age,
     summarize_senders,
 )
-from email_cleaner.ui import human_size, truncate
+from email_cleaner.ui import colors_enabled, human_size, progress, truncate
 
 
 def _mail(uid, sender="Shop <deals@shop.com>", subject="Sale!", unsub=None):
@@ -193,6 +195,62 @@ class TestStandardCriteria(unittest.TestCase):
             Filters(promo_only=False, older_than_days=0, include_starred=True)
         )
         self.assertEqual(crit, ["ALL"])
+
+
+class TestBlankFilterTerms(unittest.TestCase):
+    """A blank term used to widen the search instead of doing nothing: IMAP's
+    TEXT "" is in every message, so one empty --keyword matched the whole
+    folder. Padding did the same on Gmail, where '-from: x' is an empty
+    exclusion plus a required keyword."""
+
+    def test_blank_keyword_does_not_become_match_everything(self):
+        crit = build_standard_criteria(
+            Filters(keywords=[""], promo_only=False, older_than_days=0, include_starred=True)
+        )
+        self.assertNotIn("TEXT", crit)
+        self.assertEqual(crit, ["ALL"])
+
+    def test_blank_terms_are_dropped_but_real_ones_survive(self):
+        crit = build_standard_criteria(
+            Filters(keywords=["", "sale", "   "], promo_only=False,
+                    older_than_days=0, include_starred=True)
+        )
+        self.assertEqual(crit.count("TEXT"), 1)
+        self.assertIn('"sale"', crit)
+        self.assertNotIn("OR", crit)
+
+    def test_blank_sender_is_dropped(self):
+        crit = build_standard_criteria(
+            Filters(from_senders=["  "], promo_only=False,
+                    older_than_days=0, include_starred=True)
+        )
+        self.assertEqual(crit, ["ALL"])
+
+    def test_padded_terms_are_stripped_before_searching(self):
+        crit = build_standard_criteria(Filters(keywords=[" sale "]))
+        self.assertIn('"sale"', crit)
+        self.assertNotIn('" sale "', crit)
+
+    def test_padded_protect_does_not_become_a_required_keyword(self):
+        q = build_gmail_query(Filters(protected_senders=[" amazon.com"]))
+        self.assertIn("-from:amazon.com", q)
+        self.assertNotIn("-from: ", q)
+
+    def test_blank_protect_leaves_no_dangling_exclusion(self):
+        q = build_gmail_query(Filters(protected_senders=["", "  "]))
+        self.assertNotIn("-from:", q)
+
+    def test_protect_with_a_space_is_quoted(self):
+        q = build_gmail_query(Filters(protected_senders=["big corp"]))
+        self.assertIn('-from:"big corp"', q)
+
+    def test_blank_keyword_does_not_hide_the_wide_open_warning(self):
+        # cli decides "this matches everything" from these lists, and a [""]
+        # list is truthy - so the warning was skipped on the widest search there is
+        filters = Filters(keywords=[""], from_senders=[""], promo_only=False,
+                          older_than_days=0, include_starred=True)
+        self.assertEqual(filters.keywords, [])
+        self.assertEqual(filters.from_senders, [])
 
 
 class TestProtection(unittest.TestCase):
@@ -483,6 +541,13 @@ class TestUiHelpers(unittest.TestCase):
         self.assertEqual(truncate("hello", 2), "he")
         self.assertEqual(truncate("hi", 0), "")
 
+    def test_survives_a_missing_stdout(self):
+        # under pythonw sys.stdout is None; colors_enabled runs at import and
+        # called .isatty() on it, so importing ui was enough to crash
+        with mock.patch.object(sys, "stdout", None):
+            self.assertFalse(colors_enabled())
+            progress(1, 2, "Reading")  # must not raise either
+
 
 class TestSummaries(unittest.TestCase):
     def test_summarize_senders_ranks_by_count(self):
@@ -595,6 +660,20 @@ class TestResolveAccount(unittest.TestCase):
         os.environ["EMAIL_CLEANER_PORT"] = "not-a-number"
         with self.assertRaises(CleanerError):
             config.resolve_account(self._args())
+
+    def test_unknown_provider_is_a_friendly_error_not_a_traceback(self):
+        # --provider has no argparse choices, so a typo reached the user as a
+        # raw ValueError traceback and exit 1 instead of the documented exit 2
+        os.environ["EMAIL_CLEANER_PASSWORD"] = "x"
+        with self.assertRaises(CleanerError) as caught:
+            config.resolve_account(self._args(provider="fastmail"))
+        self.assertIn("fastmail", str(caught.exception))
+        self.assertTrue(caught.exception.hint)
+
+    def test_known_provider_still_resolves(self):
+        os.environ["EMAIL_CLEANER_PASSWORD"] = "x"
+        account = config.resolve_account(self._args(provider="GMAIL"))
+        self.assertEqual(account.host, "imap.gmail.com")
 
 
 def _settings(backend="ollama", **over):
@@ -809,6 +888,44 @@ class TestClassifierClassify(unittest.TestCase):
         out = clf.classify(self._emails(15))  # 10 then 5
         # first batch failed (kept), second batch classified
         self.assertEqual(len(out), 5)
+
+
+class TestExtractText(unittest.TestCase):
+    """Every unreadable shape has to come back as None so _call turns it into a
+    _BackendError and the batch keeps. A backend answering with a bare JSON
+    array or string has no .get, and that AttributeError used to escape."""
+
+    def test_normal_shapes(self):
+        self.assertEqual(_extract_text("ollama", {"message": {"content": "hi"}}), "hi")
+        self.assertEqual(
+            _extract_text("openai", {"choices": [{"message": {"content": "hi"}}]}), "hi")
+        self.assertEqual(
+            _extract_text("anthropic", {"content": [{"type": "text", "text": "hi"}]}), "hi")
+
+    def test_junk_payloads_are_none_not_exceptions(self):
+        for backend in ("ollama", "openai", "anthropic"):
+            for payload in ([], "oops", 7, None, {}, {"content": "not a list"}):
+                with self.subTest(backend=backend, payload=payload):
+                    self.assertIsNone(_extract_text(backend, payload))
+
+    def test_a_junk_payload_keeps_the_batch_instead_of_crashing(self):
+        # end to end through the real _call: valid JSON, wrong shape
+        clf = Classifier(_settings("anthropic", api_key="k"), batch_size=10)
+
+        class _Resp:
+            def read(self):
+                return b"[]"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return False
+
+        with mock.patch("urllib.request.urlopen", lambda *a, **k: _Resp()):
+            out = clf.classify([_mail("1"), _mail("2")])
+        self.assertEqual(out, {})  # empty verdicts means keep, upstream
+        self.assertIn("no content", clf.transport_error)
 
 
 class TestApplyAi(unittest.TestCase):

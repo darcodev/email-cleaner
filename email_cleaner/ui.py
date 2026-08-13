@@ -47,7 +47,9 @@ def _windows_ansi_ok() -> bool:
 def colors_enabled() -> bool:
     if os.environ.get("NO_COLOR") is not None:
         return False
-    if not sys.stdout.isatty():
+    # the stream can be missing entirely (under pythonw sys.stdout is None), and
+    # this runs at import, so don't assume isatty is there to call
+    if not getattr(sys.stdout, "isatty", lambda: False)():
         return False
     return _windows_ansi_ok()
 
@@ -158,7 +160,8 @@ def table(headers: list[str], rows: list[list[str]], max_width: int | None = Non
 
 def progress(done: int, total: int, label: str):
     """Single line progress counter that overwrites itself."""
-    if total <= 0:
+    # print() no-ops when there is no stdout, but sys.stdout.write cannot
+    if total <= 0 or sys.stdout is None:
         return
     pct = int(done * 100 / total)
     msg = f"\r  {label} {done:,}/{total:,} ({pct}%)"

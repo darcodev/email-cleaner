@@ -20,6 +20,11 @@ VALID_CATEGORIES = ("promotions", "social", "updates", "forums")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
+def _clean_terms(values: list[str]) -> list[str]:
+    """Strip every term and drop the blank ones."""
+    return [v.strip() for v in values if v.strip()]
+
+
 @dataclass
 class Filters:
     """What counts as deletable. Defaults are deliberately cautious."""
@@ -32,6 +37,23 @@ class Filters:
     promo_only: bool = True  # False = --all, don't require promotional
     include_starred: bool = False
     limit: int | None = None
+
+    def __post_init__(self) -> None:
+        """Normalize the term lists once, here, so nothing downstream has to.
+
+        A blank term is not the harmless no-op it looks like. IMAP's TEXT ""
+        is contained in every message, so a single empty --keyword - an unset
+        shell variable in a cron line is all it takes - quietly turns a narrow
+        search into the whole folder. It also slips past the --all "this matches
+        everything" warning in cli, because a [""] list is still truthy.
+
+        Padding is just as bad on the Gmail side: '-from: amazon.com' splits
+        into an empty exclusion plus a *required* keyword, so a protect entry
+        ends up widening the search it was supposed to narrow.
+        """
+        self.keywords = _clean_terms(self.keywords)
+        self.from_senders = _clean_terms(self.from_senders)
+        self.protected_senders = _clean_terms(self.protected_senders)
 
 
 def parse_age(text: str) -> int:
@@ -94,7 +116,9 @@ def build_gmail_query(filters: Filters) -> str:
         parts.append("-is:starred")
         parts.append("-is:important")
     for sender in filters.protected_senders:
-        parts.append(f"-from:{sender}")
+        # quoted like the other terms: a bare '-from:big corp' would exclude
+        # nothing and then require 'corp' to be in the message
+        parts.append(f"-from:{_gmail_term(sender)}")
     return " ".join(parts)
 
 

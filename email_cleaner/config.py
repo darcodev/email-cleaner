@@ -112,7 +112,19 @@ def resolve_account(args) -> Account:
     provider: Provider | None = None
     provider_key = getattr(args, "provider", None)
     if provider_key:
-        provider = get_provider(provider_key)
+        try:
+            provider = get_provider(provider_key)
+        except ValueError as exc:
+            # --provider takes no argparse choices (custom servers need the
+            # escape hatch), so a typo lands here. It is a fixable setting, not
+            # a crash - the tool promises a plain error instead of a traceback.
+            raise CleanerError(
+                str(exc),
+                hint=(
+                    "Drop --provider to detect it from your address, or point "
+                    f"at the server yourself with --host/--port (or {ENV_HOST})."
+                ),
+            ) from None
     else:
         provider = guess_provider(address)
 
