@@ -3,6 +3,7 @@
 Run with:  python -m unittest discover -s tests -v
 """
 
+import imaplib
 import json
 import os
 import sys
@@ -102,6 +103,22 @@ class TestImapDate(unittest.TestCase):
 
     def test_year_rollover(self):
         self.assertEqual(imap_date(365, today=datetime(2026, 1, 1)), "01-Jan-2025")
+
+    def test_an_absurd_age_clamps_instead_of_raising(self):
+        # '--older-than 3000y', or a fat-fingered day count, walked off the end
+        # of the calendar and raised OverflowError as a raw traceback
+        for days in (parse_age("3000y"), parse_age("99999999"), 10 ** 12):
+            with self.subTest(days=days):
+                self.assertEqual(imap_date(days, today=datetime(2026, 7, 2)), "01-Jan-0001")
+
+    def test_the_clamped_date_is_still_a_4_digit_year(self):
+        # IMAP's date-year is 4DIGIT, so "01-Jan-1" would be a malformed search
+        self.assertRegex(imap_date(10 ** 9, today=datetime(2026, 7, 2)), r"^\d{2}-\w{3}-\d{4}$")
+
+    def test_an_absurd_age_reaches_the_search_criteria(self):
+        crit = build_standard_criteria(Filters(older_than_days=parse_age("3000y")))
+        self.assertIn("BEFORE", crit)
+        self.assertIn("01-Jan-0001", crit)
 
 
 class TestGmailQuery(unittest.TestCase):
@@ -429,6 +446,57 @@ class TestExpungeScope(unittest.TestCase):
         session, _ = _fake_session(["UIDPLUS"], fail_on=("STORE",))
         with self.assertRaises(CleanerError):
             session.move_to_trash(["7"], "Trash")
+
+
+class TestCapabilities(unittest.TestCase):
+    """The post-login refresh is only ever added to what imaplib parsed at
+    login. Replacing it meant a NO or empty CAPABILITY reply left the session
+    believing the server supports nothing - which silently swaps Gmail search
+    for a different match set and drops UID EXPUNGE for the unscoped one."""
+
+    class _Conn:
+        capabilities = ("IMAP4REV1", "MOVE", "UIDPLUS")
+
+        def __init__(self, reply):
+            self.reply = reply
+
+        def capability(self):
+            if isinstance(self.reply, Exception):
+                raise self.reply
+            return self.reply
+
+    def _caps(self, reply):
+        session = ImapSession("host", 993, "me@x.com", "pw")
+        session._imap = self._Conn(reply)
+        session._load_capabilities()
+        return session
+
+    def test_refresh_adds_what_login_did_not_advertise(self):
+        session = self._caps(("OK", [b"IMAP4REV1 MOVE UIDPLUS X-GM-EXT-1 UNSELECT"]))
+        self.assertTrue(session.supports_gmail_search)
+        self.assertTrue(session.supports_unselect)
+        self.assertTrue(session.supports_uid_expunge)
+
+    def test_a_useless_refresh_keeps_the_login_capabilities(self):
+        for reply in (
+            ("NO", [b"not now"]),
+            ("OK", [b""]),
+            ("OK", [None]),
+            ("OK", []),
+            imaplib.IMAP4.error("boom"),
+        ):
+            with self.subTest(reply=reply):
+                session = self._caps(reply)
+                self.assertTrue(session.supports_uid_expunge, "lost scoped expunge")
+                self.assertTrue(session.supports_move, "lost MOVE")
+
+    def test_a_server_that_really_has_nothing_is_believed(self):
+        session = ImapSession("host", 993, "me@x.com", "pw")
+        session._imap = self._Conn(("OK", [b"IMAP4REV1"]))
+        session._imap.capabilities = ("IMAP4REV1",)
+        session._load_capabilities()
+        self.assertFalse(session.supports_uid_expunge)
+        self.assertFalse(session.supports_gmail_search)
 
 
 class TestSessionTeardown(unittest.TestCase):

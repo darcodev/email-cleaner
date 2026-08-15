@@ -265,14 +265,28 @@ class ImapSession:
                 ),
             ) from exc
 
-        # Some servers (Gmail included) only advertise their full capability
-        # list after login, so refresh it now.
+        self._load_capabilities()
+
+    def _load_capabilities(self) -> None:
+        """Work out what this server can do, erring towards what it told us.
+
+        Some servers (Gmail included) only advertise their full list after
+        login, so the post-login refresh is worth asking for - but it is only
+        ever added to what imaplib already parsed from the greeting, never
+        swapped in for it. A refresh that comes back NO, or OK with an empty
+        payload, used to leave us believing the server supports nothing at all:
+        Gmail search off (so a different set of mail matches), MOVE off, and
+        worst of all UID EXPUNGE off, which drops the purge to the unscoped
+        bare EXPUNGE that takes other clients' pending deletions with it.
+        """
+        conn = self._conn()
+        self._capabilities = {c.upper() for c in conn.capabilities}
         try:
-            typ, data = self._imap.capability()
+            typ, data = conn.capability()
             if typ == "OK" and data and data[0]:
-                self._capabilities = {c.upper() for c in data[0].decode().split()}
+                self._capabilities |= {c.upper() for c in data[0].decode().split()}
         except imaplib.IMAP4.error:
-            self._capabilities = {c.upper() for c in self._imap.capabilities}
+            pass
 
     @property
     def supports_gmail_search(self) -> bool:

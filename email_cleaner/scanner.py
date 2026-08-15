@@ -82,8 +82,21 @@ def parse_age(text: str) -> int:
 
 
 def imap_date(days_ago: int, today: datetime | None = None) -> str:
-    day = (today or datetime.now()) - timedelta(days=days_ago)
-    return f"{day.day:02d}-{_MONTHS[day.month - 1]}-{day.year}"
+    """The IMAP-format date `days_ago` days before today (02-Jul-2026).
+
+    An absurd age pushes that subtraction past the earliest date Python can
+    represent: '--older-than 3000y' - or a fat-fingered '--older-than 99999999'
+    - raised OverflowError and a raw traceback for something the user typed.
+    Clamp instead, because "older than the dawn of time" is a perfectly well
+    defined search: it matches nothing, which is what was asked for.
+    """
+    now = today or datetime.now()
+    try:
+        day = now - timedelta(days=days_ago)
+    except OverflowError:
+        day = datetime.min
+    # 4-digit year: the clamp lands in year 1, and IMAP's date-year is 4DIGIT
+    return f"{day.day:02d}-{_MONTHS[day.month - 1]}-{day.year:04d}"
 
 
 def _gmail_term(word: str) -> str:
