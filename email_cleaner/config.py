@@ -45,10 +45,19 @@ def _clean_value(value: str) -> str:
     A quoted value keeps everything between the quotes verbatim, so a '#' or
     spaces in a password survive. An unquoted value has a trailing inline
     '# comment' stripped, matching how people annotate a .env.
+
+    The quoted case ends at its closing quote rather than at the end of the
+    line. Requiring the line to *finish* on that quote meant a perfectly
+    ordinary annotated line - PASSWORD="a b c"  # gmail app password - matched
+    neither branch: the quotes stayed in, and IMAP got a password with two
+    stray '"' in it and rejected it as simply wrong.
     """
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-        return value[1:-1]
+    quote = value[:1]
+    if quote in ("'", '"'):
+        end = value.find(quote, 1)
+        if end != -1:
+            return value[1:end]  # anything past the closing quote is a comment
     marker = value.find(" #")  # inline comment must have space before the hash
     if marker != -1:
         value = value[:marker]

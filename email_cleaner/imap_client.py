@@ -242,15 +242,24 @@ class ImapSession:
             self._imap = imaplib.IMAP4_SSL(
                 self.host, self.port, ssl_context=ssl.create_default_context(), timeout=30
             )
+        # ssl.SSLError is a subclass of OSError, so it has to be caught first.
+        # Behind the reachability handler it was dead code, and every TLS
+        # failure - a plaintext port like 143 answering the handshake, an
+        # expired or untrusted certificate - came out as "could not reach
+        # host", telling the user to check an internet connection that was
+        # working fine and never mentioning the port they had actually mistyped.
+        except ssl.SSLError as exc:
+            raise CleanerError(
+                f"TLS handshake with {self.host} failed ({exc}).",
+                hint=(
+                    "The server may not support implicit TLS on this port. "
+                    "Most IMAP servers use 993; try --port 993."
+                ),
+            ) from exc
         except (socket.gaierror, TimeoutError, OSError) as exc:
             raise CleanerError(
                 f"Could not reach {self.host}:{self.port} ({exc}).",
                 hint="Check your internet connection and the IMAP host name.",
-            ) from exc
-        except ssl.SSLError as exc:
-            raise CleanerError(
-                f"TLS handshake with {self.host} failed ({exc}).",
-                hint="The server may not support implicit TLS on this port.",
             ) from exc
 
         try:

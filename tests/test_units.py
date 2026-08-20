@@ -6,6 +6,8 @@ Run with:  python -m unittest discover -s tests -v
 import imaplib
 import json
 import os
+import socket
+import ssl
 import sys
 import tempfile
 import unittest
@@ -499,6 +501,47 @@ class TestCapabilities(unittest.TestCase):
         self.assertFalse(session.supports_gmail_search)
 
 
+class TestConnectErrors(unittest.TestCase):
+    """ssl.SSLError subclasses OSError, so catching the latter first swallows
+    every TLS failure and blames the network for a wrong port or a bad cert."""
+
+    def _connect_with(self, exc):
+        session = ImapSession("mail.example.com", 143, "me@x.com", "pw")
+        with mock.patch("imaplib.IMAP4_SSL", side_effect=exc):
+            with self.assertRaises(CleanerError) as caught:
+                session.connect()
+        return caught.exception
+
+    def test_tls_failure_is_reported_as_a_tls_failure(self):
+        err = self._connect_with(ssl.SSLError("WRONG_VERSION_NUMBER"))
+        self.assertIn("TLS handshake", str(err))
+        self.assertIn("993", err.hint)
+
+    def test_a_bad_certificate_is_a_tls_failure_too(self):
+        err = self._connect_with(ssl.SSLCertVerificationError("certificate verify failed"))
+        self.assertIn("TLS handshake", str(err))
+
+    def test_an_unreachable_host_still_reports_reachability(self):
+        for exc in (
+            socket.gaierror("name or service not known"),
+            TimeoutError("timed out"),
+            ConnectionRefusedError("refused"),
+        ):
+            with self.subTest(exc=type(exc).__name__):
+                err = self._connect_with(exc)
+                self.assertIn("Could not reach", str(err))
+                self.assertNotIn("TLS", str(err))
+
+    def test_a_rejected_password_is_still_a_login_error(self):
+        session = ImapSession("mail.example.com", 993, "me@x.com", "pw")
+        conn = mock.Mock()
+        conn.login.side_effect = imaplib.IMAP4.error("AUTHENTICATIONFAILED")
+        with mock.patch("imaplib.IMAP4_SSL", return_value=conn):
+            with self.assertRaises(CleanerError) as caught:
+                session.connect()
+        self.assertIn("Login failed", str(caught.exception))
+
+
 class TestSessionTeardown(unittest.TestCase):
     """IMAP CLOSE purges every \\Deleted message in a writable mailbox on its
     way out - the same unscoped wipe UID EXPUNGE exists to avoid. 'clean' opens
@@ -688,6 +731,27 @@ class TestDotenv(unittest.TestCase):
     def test_hash_inside_quoted_value_is_kept(self):
         config.load_dotenv(self._write('EMAIL_CLEANER_PASSWORD="a # b"\n'))
         self.assertEqual(os.environ["EMAIL_CLEANER_PASSWORD"], "a # b")
+
+    def test_quoted_value_with_a_trailing_comment_loses_its_quotes(self):
+        # the quotes used to survive into the value, because the line no longer
+        # *ended* on one - so IMAP got a password with two stray '"' in it and
+        # the user was told their app password was wrong
+        config.load_dotenv(
+            self._write('EMAIL_CLEANER_PASSWORD="abcd efgh"  # gmail app password\n')
+        )
+        self.assertEqual(os.environ["EMAIL_CLEANER_PASSWORD"], "abcd efgh")
+
+    def test_single_quoted_value_with_a_trailing_comment(self):
+        config.load_dotenv(self._write("EMAIL_CLEANER_HOST='h.example.com'  # main\n"))
+        self.assertEqual(os.environ["EMAIL_CLEANER_HOST"], "h.example.com")
+
+    def test_a_hash_after_the_closing_quote_is_a_comment_one_inside_is_not(self):
+        config.load_dotenv(self._write('EMAIL_CLEANER_PASSWORD="a # b"  # note\n'))
+        self.assertEqual(os.environ["EMAIL_CLEANER_PASSWORD"], "a # b")
+
+    def test_unterminated_quote_is_left_alone(self):
+        config.load_dotenv(self._write('EMAIL_CLEANER_HOST="h.example.com\n'))
+        self.assertEqual(os.environ["EMAIL_CLEANER_HOST"], '"h.example.com')
 
     def test_real_env_is_not_overwritten(self):
         os.environ["EMAIL_CLEANER_EMAIL"] = "real@env.com"
