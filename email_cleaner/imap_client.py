@@ -413,7 +413,12 @@ class ImapSession:
                 hint="Use --folder to pick a folder that exists on your server.",
             )
         self.selected_folder = folder
-        if held is not None:
+        # first reading wins. Yahoo answers STATUS with the real folder size
+        # only until the mailbox has been opened in this session; every later
+        # select gets the size of the window back instead, and overwriting with
+        # that made the two numbers agree and silently retired the warning that
+        # most of the folder is out of reach.
+        if held is not None and folder not in self._folder_totals:
             self._folder_totals[folder] = held
         try:
             return int(data[0])

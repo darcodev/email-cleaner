@@ -737,6 +737,41 @@ class TestConnectErrors(unittest.TestCase):
         self.assertIn("Login failed", str(caught.exception))
 
 
+class TestFolderTotalIsTakenOnce(unittest.TestCase):
+    """Yahoo answers STATUS with the real folder size only until the mailbox is
+    opened; after that it reports the windowed view. A --repeat run selects the
+    folder once per pass, so re-reading it replaced 234053 with 10000 and the
+    "most of this folder is out of reach" warning quietly stopped firing."""
+
+    class _Conn:
+        state = "SELECTED"
+
+        def __init__(self, counts):
+            self.counts = list(counts)
+
+        def status(self, mailbox, names):
+            value = self.counts.pop(0)
+            return "OK", [('"Inbox" (MESSAGES %d)' % value).encode()]
+
+        def select(self, mailbox, readonly=False):
+            return "OK", [b"10000"]
+
+    def test_later_selects_do_not_lower_the_count(self):
+        session = ImapSession("h", 993, "me@x.com", "pw")
+        session._imap = self._Conn([234053, 10000, 10000])
+        for _ in range(3):
+            session.select("INBOX", readonly=True)
+        self.assertEqual(session.folder_message_count("INBOX"), 234053)
+
+    def test_a_reconnect_lets_it_be_read_again(self):
+        session = ImapSession("h", 993, "me@x.com", "pw")
+        session._imap = self._Conn([234053, 10000])
+        session.select("INBOX", readonly=True)
+        with mock.patch.object(ImapSession, "connect"):
+            session.reconnect()
+        self.assertEqual(session._folder_totals, {})
+
+
 class TestSessionTeardown(unittest.TestCase):
     """IMAP CLOSE purges every \\Deleted message in a writable mailbox on its
     way out - the same unscoped wipe UID EXPUNGE exists to avoid. 'clean' opens
