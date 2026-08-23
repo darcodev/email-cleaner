@@ -258,6 +258,32 @@ matters, especially on Gmail, so here is exactly what each one does.
 | `clean --empty-trash` | Does the move above, then empties your entire Trash folder. | No. Anything already in Trash is deleted too. |
 | `clean --permanent` | Marks the matches deleted in place and purges those exact messages, skipping Trash. | No. |
 
+### Cleaning more than one window (`--repeat`)
+
+One run can only act on what the server shows it. Yahoo returns at most 1000
+results per search and exposes only the newest 10000 messages of a folder, so a
+single pass barely dents a large mailbox. `--repeat` runs passes until one
+matches nothing, re-opening the folder each time - which is what lets the mail
+you just cleared be replaced by older mail that was previously out of reach.
+
+```bash
+email-cleaner clean --older-than 30d --repeat
+```
+
+It asks for confirmation once, for the whole series, not once per pass, and
+`--max-passes N` (default 25) bounds it. Ctrl-C stops it between passes and it
+still reports what it moved. `--empty-trash` runs once at the end, after the
+last pass.
+
+Two things worth knowing before leaning on it. The window only advances as far
+as you empty it, so anything you keep stays in the way: if 40% of your mail is
+non-promotional, repeated promotional passes stall once those fill the window -
+at roughly `window size / non-promotional fraction` messages deep. And
+`--older-than` still means what it always did, so asking for mail older than
+anything currently visible matches nothing and the loop stops on its first pass.
+To reach further back, clean with an age that *does* match and let the window
+slide.
+
 A Gmail note: on Gmail, deleting a message from a folder in plain IMAP only
 removes that label; the message survives in "All Mail". The reliable way to
 truly delete on Gmail and reclaim storage is `clean --empty-trash`, which moves

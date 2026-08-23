@@ -1414,6 +1414,169 @@ class TestEmptyResultIsExplained(unittest.TestCase):
         self.assertEqual(cli._make_filters(args).older_than_days, 0)
 
 
+class _SlidingServer:
+    """A folder that only shows part of itself, the way Yahoo shows the newest
+    10000. Each batch that leaves lets the next one into view."""
+
+    supports_gmail_search = False
+    expunge_notice = None
+
+    def __init__(self, batches):
+        self.batches = [list(b) for b in batches]
+        self.moved = []
+        self.selects = 0
+        self.emptied = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def select(self, folder, readonly=True):
+        self.selects += 1
+        return len(self.batches[0]) if self.batches else 0
+
+    def folder_message_count(self, folder):
+        return None
+
+    def search_standard(self, criteria):
+        return list(self.batches[0]) if self.batches else []
+
+    def fetch_summaries(self, uids, on_progress=None, full_headers=False):
+        return [_mail(u, unsub=["https://x.com/u"]) for u in uids]
+
+    def find_trash_folder(self, hint=None):
+        return "Trash"
+
+    def move_to_trash(self, uids, trash, on_progress=None):
+        self.moved.append(list(uids))
+        if self.batches:
+            self.batches.pop(0)  # that batch left, so the window slides
+        return len(uids)
+
+    def delete_permanently(self, uids, on_progress=None):
+        return self.move_to_trash(uids, "Trash")
+
+    def empty_trash(self, trash, on_progress=None):
+        self.emptied += 1
+        return 42
+
+
+def _acct():
+    return config.Account("me@x.com", "pw", "h", 993, "custom", None)
+
+
+class TestRepeatPasses(unittest.TestCase):
+    """--repeat exists because some servers only expose part of a folder. One
+    pass can only ever see the current window; clearing it reveals the next."""
+
+    def _drive(self, server, args, confirm=None):
+        out = []
+        patches = [
+            mock.patch.object(cli.config, "resolve_account", lambda a: _acct()),
+            mock.patch.object(cli, "ImapSession", lambda *a, **k: server),
+            mock.patch.object(cli.ui, "ok", out.append),
+            mock.patch.object(cli.ui, "info", out.append),
+            mock.patch.object(cli.ui, "warn", out.append),
+            mock.patch.object(cli.ui, "heading", out.append),
+            mock.patch("builtins.print", lambda *a, **k: None),
+        ]
+        if confirm is not None:
+            patches.append(mock.patch.object(cli.ui, "confirm", confirm))
+        for p in patches:
+            p.start()
+        try:
+            rc = cli.cmd_clean(args)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return rc, " ".join(out)
+
+    def _run(self, batches, argv=("clean", "--yes", "--repeat"), **flags):
+        server = _SlidingServer(batches)
+        args = cli.build_parser().parse_args(list(argv))
+        for k, v in flags.items():
+            setattr(args, k, v)
+        rc, text = self._drive(server, args)
+        return rc, server, text
+
+    def test_it_keeps_going_until_a_pass_matches_nothing(self):
+        rc, server, text = self._run([["1", "2"], ["3"], ["4", "5", "6"]])
+        self.assertEqual(rc, 0)
+        self.assertEqual(server.moved, [["1", "2"], ["3"], ["4", "5", "6"]])
+        self.assertIn("6 emails moved to Trash over 3 pass(es)", text)
+        self.assertIn("nothing left to match", text)
+
+    def test_it_reopens_the_folder_each_pass(self):
+        # re-selecting is what exposes the mail the last pass made room for
+        _, server, _ = self._run([["1"], ["2"], ["3"]])
+        self.assertEqual(server.selects, 4)  # 3 productive passes + the empty one
+
+    def test_one_pass_without_the_flag(self):
+        _, server, text = self._run([["1"], ["2"]], argv=("clean", "--yes"))
+        self.assertEqual(server.moved, [["1"]])
+        self.assertNotIn("pass(es)", text)
+
+    def test_max_passes_caps_it(self):
+        batches = [[str(i)] for i in range(10)]
+        _, server, text = self._run(batches, max_passes=3)
+        self.assertEqual(len(server.moved), 3)
+        self.assertIn("reached the 3-pass limit", text)
+
+    def test_it_asks_once_not_once_per_pass(self):
+        server = _SlidingServer([["1"], ["2"], ["3"]])
+        args = cli.build_parser().parse_args(["clean", "--repeat"])
+        asked = []
+
+        def confirm(question, danger=False):
+            asked.append(question)
+            return True
+
+        self._drive(server, args, confirm=confirm)
+        self.assertEqual(len(asked), 1, "asked %d times: %s" % (len(asked), asked))
+        self.assertIn("repeat until nothing matches", asked[0])
+        self.assertEqual(len(server.moved), 3)
+
+    def test_declining_moves_nothing(self):
+        server = _SlidingServer([["1"], ["2"]])
+        args = cli.build_parser().parse_args(["clean", "--repeat"])
+        rc, _ = self._drive(server, args, confirm=lambda q, danger=False: False)
+        self.assertEqual(rc, 1)
+        self.assertEqual(server.moved, [])
+
+    def test_the_trash_is_emptied_once_at_the_end(self):
+        _, server, text = self._run([["1"], ["2"], ["3"]], empty_trash=True)
+        self.assertEqual(server.emptied, 1)
+        self.assertEqual(len(server.moved), 3)
+        self.assertIn("Trash emptied", text)
+
+    def test_a_pass_that_moves_nothing_stops_the_loop(self):
+        server = _SlidingServer([["1"], ["2"]])
+        server.move_to_trash = lambda uids, trash, on_progress=None: 0
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        _, text = self._drive(server, args)
+        self.assertIn("a pass moved nothing", text)
+
+    def test_stopping_it_still_reports_what_was_done(self):
+        server = _SlidingServer([["1", "2"], ["3"], ["4"]])
+        real_move = server.move_to_trash
+        calls = []
+
+        def move(uids, trash, on_progress=None):
+            calls.append(uids)
+            if len(calls) == 2:
+                raise KeyboardInterrupt
+            return real_move(uids, trash)
+
+        server.move_to_trash = move
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        rc, text = self._drive(server, args)
+        self.assertEqual(rc, 0)
+        self.assertIn("you stopped it", text)
+        self.assertIn("2 emails moved to Trash", text)  # the first pass survived
+
+
 class TestResolveAiSettings(unittest.TestCase):
     KEYS = ("EMAIL_CLEANER_AI_BACKEND", "EMAIL_CLEANER_AI_MODEL",
             "EMAIL_CLEANER_AI_API_KEY", "EMAIL_CLEANER_AI_HOST",

@@ -166,6 +166,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="after moving, empty the whole Trash folder to delete for good (NOT recoverable)",
     )
+    clean.add_argument(
+        "--repeat",
+        action="store_true",
+        help=(
+            "keep going in passes until a pass matches nothing. For servers that "
+            "only show part of a folder (Yahoo caps IMAP at the newest 10000 and "
+            "one search at 1000), each pass lets older mail into view"
+        ),
+    )
+    clean.add_argument(
+        "--max-passes",
+        type=int,
+        default=25,
+        metavar="N",
+        help="stop --repeat after this many passes (default 25)",
+    )
     unsub = sub.add_parser(
         "unsubscribe",
         parents=[common],
@@ -334,6 +350,56 @@ def cmd_scan(args) -> int:
     return 0
 
 
+def _confirm_clean(args, count: int, filters: Filters, repeating: bool) -> bool:
+    """The gate before anything moves. True to go ahead.
+
+    Asked once per run, not once per pass: --repeat is approved as a whole, so
+    the answer has to say what it is approving - an unbounded series of moves,
+    not the one batch on screen.
+    """
+    # --all with no age and no keywords means the whole folder matched,
+    # so be extra careful even for a trash move
+    wide_open = args.all and filters.older_than_days == 0 and not (
+        filters.keywords or filters.from_senders
+    )
+    more = " and keep going until nothing matches" if repeating else ""
+    if args.permanent:
+        ui.warn(f"--permanent will delete {count} emails FOREVER. No Trash, no undo.")
+        if repeating:
+            ui.warn(f"--repeat will do this again every pass, up to {args.max_passes}.")
+        return args.yes or ui.confirm(f"Permanently delete them{more}?", danger=True)
+    if wide_open:
+        # matches the whole folder; warn even under --yes, only the
+        # prompt itself is skippable
+        ui.warn(f"This matches every message in '{args.folder}'.")
+        return args.yes or ui.confirm(
+            f"Move all {count} of them to Trash{more}?", danger=True
+        )
+    if repeating:
+        return args.yes or ui.confirm(
+            f"Move {count} emails to Trash and repeat until nothing matches "
+            f"(up to {args.max_passes} passes, recoverable in Trash)?",
+            danger=True,
+        )
+    return args.yes or ui.confirm(
+        f"Move {count} emails to Trash (recoverable there for ~30 days)?"
+    )
+
+
+def _empty_trash_step(session, args, trash: str):
+    """Empty the Trash if it was asked for. Returns the count, or None."""
+    print()
+    ui.warn("Emptying the Trash permanently deletes everything in it - no undo.")
+    # a menu run already asked; a --yes run opted out of prompts
+    pre_ok = args.yes or getattr(args, "_empty_trash_confirmed", False)
+    if pre_ok or ui.confirm("Empty the Trash now?", danger=True):
+        return session.empty_trash(
+            trash, on_progress=lambda d, t: ui.progress(d, t, "Emptying Trash")
+        )
+    ui.info("Left the Trash as-is.")
+    return None
+
+
 def cmd_clean(args) -> int:
     account = config.resolve_account(args)
     filters = _make_filters(args)
@@ -344,14 +410,82 @@ def cmd_clean(args) -> int:
         ui.info("Cancelled, nothing was changed.")
         return 1
     started = time.monotonic()
+    repeating = getattr(args, "repeat", False)
+    max_passes = max(1, args.max_passes) if repeating else 1
+
+    moved_total = 0
+    bytes_total = 0
+    passes_run = 0
+    action = "moved to Trash"
+    emptied = None
+    stopped_by = ""
 
     with ImapSession(account.host, account.port, account.address, account.password) as session:
         ui.ok(f"Connected to {account.host} as {account.address}")
-        session.select(args.folder, readonly=False)
-        result = _run_scan(session, args, filters, classifier)
-        _show_report(result, explain=args.ai_explain)
-        if not result.emails:
-            if args.empty_trash:
+        approved = False
+        trash = None
+        for attempt in range(1, max_passes + 1):
+            # re-open the folder each pass: on a server that only exposes part
+            # of it, this is what lets the mail we just moved out be replaced
+            # by older mail we could not previously see
+            session.select(args.folder, readonly=False)
+            if repeating:
+                ui.heading(f"Pass {attempt} of at most {max_passes}")
+            try:
+                result = _run_scan(session, args, filters, classifier)
+                if attempt == 1:
+                    _show_report(result, explain=args.ai_explain)
+                elif result.emails:
+                    ui.info(
+                        f"{len(result.emails)} match(es), "
+                        f"~{ui.human_size(result.total_size)}."
+                    )
+                if not result.emails:
+                    stopped_by = "nothing left to match" if passes_run else "nothing matched"
+                    break
+
+                print()
+                if not approved:
+                    if not _confirm_clean(args, len(result.emails), filters, repeating):
+                        ui.info("Cancelled, nothing was changed.")
+                        return 1
+                    approved = True  # a repeat run is approved once, not per pass
+
+                uids = [e.uid for e in result.emails]
+                if args.permanent:
+                    done = session.delete_permanently(
+                        uids, on_progress=lambda d, t: ui.progress(d, t, "Deleting")
+                    )
+                    action = "deleted"
+                else:
+                    trash = trash or session.find_trash_folder(account.trash_folder)
+                    done = session.move_to_trash(
+                        uids, trash,
+                        on_progress=lambda d, t: ui.progress(d, t, "Moving to Trash"),
+                    )
+            except KeyboardInterrupt:
+                # "until I say stop" - report what did happen rather than
+                # unwinding to main() and losing the tally
+                stopped_by = "you stopped it"
+                print()
+                break
+
+            passes_run = attempt
+            moved_total += done
+            bytes_total += result.total_size
+            if done == 0:
+                # nothing actually left the folder, so the next pass would see
+                # the same mail again; stop rather than spin
+                stopped_by = "a pass moved nothing"
+                break
+        else:
+            stopped_by = f"reached the {max_passes}-pass limit"
+
+        if args.empty_trash and not args.permanent:
+            if moved_total:
+                trash = trash or session.find_trash_folder(account.trash_folder)
+                emptied = _empty_trash_step(session, args, trash)
+            else:
                 # the full-word Trash prompt was answered before the scan ran.
                 # Going quiet here reads as "it emptied"; say plainly that it
                 # did not, because that answer was for a step we never reached.
@@ -359,70 +493,18 @@ def cmd_clean(args) -> int:
                     "Nothing matched, so nothing moved - and the Trash was left "
                     "as it is. Emptying it only runs after a move."
                 )
-            return 0
-
-        print()
-        count = len(result.emails)
-        # --all with no age and no keywords means the whole folder matched,
-        # so be extra careful even for a trash move
-        wide_open = args.all and filters.older_than_days == 0 and not (
-            filters.keywords or filters.from_senders
-        )
-        if args.permanent:
-            ui.warn(f"--permanent will delete {count} emails FOREVER. No Trash, no undo.")
-            if not args.yes and not ui.confirm("Permanently delete them?", danger=True):
-                ui.info("Cancelled, nothing was changed.")
-                return 1
-        elif wide_open:
-            # matches the whole folder; warn even under --yes, only the
-            # prompt itself is skippable
-            ui.warn(f"This matches every message in '{args.folder}'.")
-            if not args.yes and not ui.confirm(
-                f"Move all {count} of them to Trash?", danger=True
-            ):
-                ui.info("Cancelled, nothing was changed.")
-                return 1
-        else:
-            if not args.yes and not ui.confirm(
-                f"Move {count} emails to Trash (recoverable there for ~30 days)?"
-            ):
-                ui.info("Cancelled, nothing was changed.")
-                return 1
-
-        uids = [e.uid for e in result.emails]
-        emptied = None
-        if args.permanent:
-            done = session.delete_permanently(
-                uids, on_progress=lambda d, t: ui.progress(d, t, "Deleting")
-            )
-            action = "deleted"
-        else:
-            trash = session.find_trash_folder(account.trash_folder)
-            done = session.move_to_trash(
-                uids, trash, on_progress=lambda d, t: ui.progress(d, t, "Moving to Trash")
-            )
-            action = "moved to Trash"
-            if args.empty_trash:
-                print()
-                ui.warn(
-                    "Emptying the Trash permanently deletes everything in it - no undo."
-                )
-                # a menu run already asked; a --yes run opted out of prompts
-                pre_ok = args.yes or getattr(args, "_empty_trash_confirmed", False)
-                if pre_ok or ui.confirm("Empty the Trash now?", danger=True):
-                    emptied = session.empty_trash(
-                        trash, on_progress=lambda d, t: ui.progress(d, t, "Emptying Trash")
-                    )
-                else:
-                    ui.info("Left the Trash as-is.")
         expunge_notice = session.expunge_notice
 
     elapsed = time.monotonic() - started
     print()
-    ui.ok(
-        f"{done} emails {action}, reclaimed ~{ui.human_size(result.total_size)} "
-        f"in {elapsed:.1f}s."
-    )
+    if moved_total:
+        over = f" over {passes_run} pass(es)" if repeating else ""
+        ui.ok(
+            f"{moved_total} emails {action}{over}, reclaimed "
+            f"~{ui.human_size(bytes_total)} in {elapsed:.1f}s."
+        )
+    if repeating and stopped_by:
+        ui.info(f"Stopped: {stopped_by}.")
     if expunge_notice:
         ui.warn(expunge_notice)
     if emptied is not None:
