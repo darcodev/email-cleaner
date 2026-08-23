@@ -14,7 +14,7 @@ import time
 
 from . import __version__, config, ui
 from .ai import Classifier
-from .errors import CleanerError
+from .errors import CleanerError, ConnectionLost
 from .imap_client import ImapSession
 from .scanner import (
     Filters,
@@ -351,6 +351,12 @@ def cmd_scan(args) -> int:
     return 0
 
 
+# How many times a --repeat run will re-establish a dropped session before
+# giving up. Yahoo hangs up every few hundred moved messages, so a long run
+# needs several; a server that drops instantly should not be retried forever.
+_MAX_RECONNECTS = 5
+
+
 def _confirm_clean(args, count: int, filters: Filters, repeating: bool) -> bool:
     """The gate before anything moves. True to go ahead.
 
@@ -417,6 +423,8 @@ def cmd_clean(args) -> int:
     moved_total = 0
     bytes_total = 0
     passes_run = 0
+    reconnects = 0
+    lost = None  # set when the session died for good, so the exit code says so
     action = "moved to Trash"
     emptied = None
     stopped_by = ""
@@ -464,6 +472,26 @@ def cmd_clean(args) -> int:
                         uids, trash,
                         on_progress=lambda d, t: ui.progress(d, t, "Moving to Trash"),
                     )
+            except ConnectionLost as exc:
+                # nothing is half-done: the next pass re-runs its own search, so
+                # whatever already moved stays moved and the rest is picked up
+                # again. Only worth retrying when there are passes left to use.
+                if not repeating or reconnects >= _MAX_RECONNECTS:
+                    lost = exc
+                    stopped_by = "the server hung up"
+                    break
+                reconnects += 1
+                ui.warn(
+                    f"{exc} Reconnecting ({reconnects} of {_MAX_RECONNECTS}) "
+                    "and carrying on."
+                )
+                try:
+                    session.reconnect()
+                except CleanerError as again:
+                    lost = again
+                    stopped_by = "could not reconnect"
+                    break
+                continue
             except KeyboardInterrupt:
                 # "until I say stop" - report what did happen rather than
                 # unwinding to main() and losing the tally
@@ -510,6 +538,12 @@ def cmd_clean(args) -> int:
         ui.warn(expunge_notice)
     if emptied is not None:
         ui.ok(f"Trash emptied: {emptied} message(s) permanently deleted.")
+    if lost is not None:
+        # whatever moved above is real and already reported; this says why the
+        # run ended early, and makes the exit code admit it rather than
+        # returning success on a session that died halfway through
+        ui.error(str(lost), hint=lost.hint)
+        return 2
     return 0
 
 

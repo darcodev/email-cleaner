@@ -6,6 +6,7 @@ Deleting means copy-to-Trash unless you ask for a permanent delete.
 from __future__ import annotations
 
 import base64
+import contextlib
 import email
 import email.header
 import email.utils
@@ -16,7 +17,7 @@ import socket
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
-from .errors import CleanerError, SearchUnsupported
+from .errors import CleanerError, ConnectionLost, SearchUnsupported
 
 # how many UIDs we put on a single IMAP command line. Bigger batches mean
 # fewer round trips (faster scans/moves), kept comfortably under the command
@@ -251,6 +252,8 @@ class ImapSession:
         # the real total until the mailbox is selected and the size of its own
         # windowed view afterwards, so open time is the only honest moment.
         self._folder_totals: dict[str, int] = {}
+        # set when the server hung up; reconnect() clears it
+        self._lost = False
 
     def connect(self) -> None:
         try:
@@ -355,6 +358,35 @@ class ImapSession:
             pass
         self._imap = None
 
+    @contextlib.contextmanager
+    def _alive(self, doing: str):
+        """Turn "the server hung up" into something callers can act on.
+
+        imaplib raises abort from deep inside _command_complete when it reads a
+        BYE, and it escaped as a traceback from every fetch and move we make.
+        """
+        try:
+            yield
+        except imaplib.IMAP4.abort as exc:
+            self._lost = True
+            raise ConnectionLost(
+                f"The server closed the connection while {doing} ({exc}).",
+                hint="Servers cut long sessions off; running it again resumes.",
+            ) from exc
+
+    def reconnect(self) -> None:
+        """Start a fresh session after the server hung up on us."""
+        try:
+            if self._imap is not None:
+                self._imap.logout()
+        except Exception:
+            pass
+        self._imap = None
+        self._lost = False
+        self.selected_folder = None
+        self._folder_totals.clear()
+        self.connect()
+
     def _conn(self) -> imaplib.IMAP4_SSL:
         if self._imap is None:
             raise CleanerError("Not connected. This is a bug, please report it.")
@@ -405,9 +437,10 @@ class ImapSession:
             return self._conn().uid("SEARCH", *args)
         except imaplib.IMAP4.abort as exc:
             # the connection itself is gone; retrying on it would only fail again
-            raise CleanerError(
+            self._lost = True
+            raise ConnectionLost(
                 f"The connection to {self.host} dropped mid-search ({exc}).",
-                hint="Run it again; if it keeps happening the server may be rate limiting.",
+                hint="Servers cut long sessions off; running it again resumes.",
             ) from exc
         except imaplib.IMAP4.error as exc:
             raise SearchUnsupported(
@@ -454,7 +487,8 @@ class ImapSession:
         if on_progress and uids:
             on_progress(0, len(uids))
         for batch in _chunks(uids, size):
-            typ, data = self._conn().uid("FETCH", ",".join(batch), parts)
+            with self._alive("reading message headers"):
+                typ, data = self._conn().uid("FETCH", ",".join(batch), parts)
             if typ != "OK":
                 raise CleanerError("Fetching message headers failed.")
             summaries.extend(_parse_fetch_response(data))
@@ -477,7 +511,8 @@ class ImapSession:
         done = 0
         part = f"(UID BODY.PEEK[1]<0.{SNIPPET_OCTETS}>)"
         for batch in _chunks(uids, FETCH_BATCH):
-            typ, data = self._conn().uid("FETCH", ",".join(batch), part)
+            with self._alive("reading message snippets"):
+                typ, data = self._conn().uid("FETCH", ",".join(batch), part)
             if typ == "OK":
                 snippets.update(_parse_snippet_response(data))
             done += len(batch)
@@ -592,10 +627,11 @@ class ImapSession:
         can_move = self.supports_move
         for batch in _chunks(uids, STORE_BATCH):
             uid_set = ",".join(batch)
-            if can_move:
-                typ, data = conn.uid("MOVE", uid_set, quoted_trash)
-            else:
-                typ, data = conn.uid("COPY", uid_set, quoted_trash)
+            with self._alive(f"moving messages to '{trash_folder}'"):
+                if can_move:
+                    typ, data = conn.uid("MOVE", uid_set, quoted_trash)
+                else:
+                    typ, data = conn.uid("COPY", uid_set, quoted_trash)
             if typ != "OK":
                 detail = (data[0] or b"").decode(errors="replace") if data else ""
                 raise CleanerError(
@@ -628,7 +664,8 @@ class ImapSession:
         conn = self._conn()
         deleted = 0
         for batch in _chunks(uids, STORE_BATCH):
-            typ, _ = conn.uid("STORE", ",".join(batch), "+FLAGS.SILENT", "(\\Deleted)")
+            with self._alive("deleting messages"):
+                typ, _ = conn.uid("STORE", ",".join(batch), "+FLAGS.SILENT", "(\\Deleted)")
             if typ != "OK":
                 raise CleanerError(
                     f"Marking messages deleted failed. {deleted} message(s) "

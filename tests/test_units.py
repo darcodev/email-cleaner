@@ -26,7 +26,7 @@ from email_cleaner.ai import (
     _loads_lenient,
     _parse_verdicts,
 )
-from email_cleaner.errors import CleanerError, SearchUnsupported
+from email_cleaner.errors import CleanerError, ConnectionLost, SearchUnsupported
 from email_cleaner.imap_client import (
     EmailSummary,
     ImapSession,
@@ -1575,6 +1575,139 @@ class TestRepeatPasses(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("you stopped it", text)
         self.assertIn("2 emails moved to Trash", text)  # the first pass survived
+
+
+class TestConnectionDrops(unittest.TestCase):
+    """Yahoo hangs up on a long session once it has moved a few hundred
+    messages. imaplib raises abort from inside _command_complete, which used to
+    escape every fetch and move as a traceback."""
+
+    def _session_that_drops(self):
+        session, conn = _fake_session(["UIDPLUS", "MOVE"])
+        conn.uid = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+        return session
+
+    def test_a_drop_while_reading_headers_is_not_a_traceback(self):
+        session = self._session_that_drops()
+        with self.assertRaises(ConnectionLost) as caught:
+            session.fetch_summaries(["1", "2"])
+        self.assertIn("reading message headers", str(caught.exception))
+        self.assertTrue(session._lost)
+
+    def test_a_drop_while_moving_is_not_a_traceback(self):
+        session = self._session_that_drops()
+        with self.assertRaises(ConnectionLost):
+            session.move_to_trash(["1"], "Trash")
+
+    def test_a_drop_while_deleting_is_not_a_traceback(self):
+        session = self._session_that_drops()
+        with self.assertRaises(ConnectionLost):
+            session.delete_permanently(["1"])
+
+    def test_a_drop_while_searching_is_not_a_traceback(self):
+        session = self._session_that_drops()
+        with self.assertRaises(ConnectionLost):
+            session.search_standard(["ALL"])
+
+    def test_it_still_prints_like_any_other_error(self):
+        self.assertTrue(issubclass(ConnectionLost, CleanerError))
+
+    def test_a_refused_search_is_not_mistaken_for_a_drop(self):
+        session, conn = _fake_session()
+        conn.uid = mock.Mock(side_effect=imaplib.IMAP4.error("BAD"))
+        with self.assertRaises(SearchUnsupported) as caught:
+            session.search_standard(["HEADER", "X", '""'])
+        self.assertNotIsInstance(caught.exception, ConnectionLost)
+
+    def test_reconnect_starts_a_fresh_session(self):
+        session, _ = _fake_session(["UIDPLUS"])
+        session._lost = True
+        session.selected_folder = "INBOX"
+        session._folder_totals["INBOX"] = 235013
+        with mock.patch.object(ImapSession, "connect") as connect:
+            session.reconnect()
+        connect.assert_called_once()
+        self.assertFalse(session._lost)
+        self.assertIsNone(session.selected_folder)
+        self.assertEqual(session._folder_totals, {})
+
+
+class TestRepeatSurvivesADrop(unittest.TestCase):
+    """A --repeat run is unattended by design, so a mid-run hang-up has to be
+    recoverable: each pass re-runs its own search, and what already moved
+    stays moved."""
+
+    class _FlakyServer(_SlidingServer):
+        def __init__(self, batches, drop_on_pass):
+            super().__init__(batches)
+            self.drop_on_pass = drop_on_pass
+            self.reconnects = 0
+            self.pass_no = 0
+
+        def search_standard(self, criteria):
+            self.pass_no += 1
+            if self.pass_no == self.drop_on_pass:
+                raise ConnectionLost("The server closed the connection.")
+            return super().search_standard(criteria)
+
+        def reconnect(self):
+            self.reconnects += 1
+
+    def _drive(self, server, args):
+        out = []
+        patches = [
+            mock.patch.object(cli.config, "resolve_account", lambda a: _acct()),
+            mock.patch.object(cli, "ImapSession", lambda *a, **k: server),
+            mock.patch.object(cli.ui, "ok", out.append),
+            mock.patch.object(cli.ui, "info", out.append),
+            mock.patch.object(cli.ui, "warn", out.append),
+            mock.patch.object(cli.ui, "heading", out.append),
+            mock.patch.object(cli.ui, "error", lambda m, hint=None: out.append(m)),
+            mock.patch("builtins.print", lambda *a, **k: None),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = cli.cmd_clean(args)
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return rc, " ".join(out)
+
+    def test_it_reconnects_and_finishes_the_job(self):
+        server = self._FlakyServer([["1"], ["2"], ["3"]], drop_on_pass=2)
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        rc, text = self._drive(server, args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(server.reconnects, 1)
+        self.assertEqual(server.moved, [["1"], ["2"], ["3"]])
+        self.assertIn("Reconnecting (1 of 5)", text)
+
+    def test_it_gives_up_after_the_reconnect_budget(self):
+        class AlwaysDrops(self._FlakyServer):
+            def search_standard(self, criteria):
+                raise ConnectionLost("The server closed the connection.")
+
+        server = AlwaysDrops([["1"]], drop_on_pass=1)
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        rc, text = self._drive(server, args)
+        self.assertEqual(rc, 2, "a session that died must not report success")
+        self.assertEqual(server.reconnects, 5)
+        self.assertIn("the server hung up", text)
+
+    def test_a_single_pass_run_does_not_retry(self):
+        server = self._FlakyServer([["1"]], drop_on_pass=1)
+        args = cli.build_parser().parse_args(["clean", "--yes"])
+        rc, text = self._drive(server, args)
+        self.assertEqual(server.reconnects, 0)
+        self.assertEqual(rc, 2)
+        self.assertIn("closed the connection", text)
+
+    def test_what_moved_before_the_drop_is_still_reported(self):
+        server = self._FlakyServer([["1", "2"], ["3"]], drop_on_pass=2)
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        _, text = self._drive(server, args)
+        self.assertIn("3 emails moved to Trash", text)
 
 
 class TestResolveAiSettings(unittest.TestCase):
