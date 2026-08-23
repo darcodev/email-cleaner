@@ -510,9 +510,19 @@ can fix yourself. The common ones:
   IMAP search terms. The tool works around this for the promotional filter (see
   [above](#how-it-decides-what-is-promotional)); if you hit it with `--all`,
   drop a filter and try again.
-- Fewer matches than you expect on Yahoo. Yahoo caps a single IMAP `SEARCH` at
-  1000 results, so a large mailbox is cleaned 1000 at a time. Run it again until
-  it comes back empty.
+- Fewer matches than you expect on Yahoo. Two separate caps. Yahoo returns at
+  most 1000 results from one `SEARCH`, so a large mailbox is cleaned 1000 at a
+  time - run it again until it comes back empty. Worse, Yahoo only exposes the
+  newest 10000 messages of a folder to IMAP at all: an Inbox whose `STATUS` says
+  235013 answers `SEARCH ALL` with 10000, and no UID range or sequence number
+  reaches past that. Older mail is invisible to every IMAP client, not just this
+  one, and can only be dealt with in Yahoo's own web interface. A run that finds
+  nothing says so when it spots this.
+- "Nothing matched" with a large `--older-than`. `--older-than` is a *minimum
+  age*, not a range: `5y` asks for mail that arrived more than five years ago,
+  not mail from the last five years. If the folder has nothing that old, zero is
+  the right answer. The run prints the cutoff date it used and the oldest
+  message it can see, so the two are easy to compare.
 - "No email address configured". Set `EMAIL_CLEANER_EMAIL` in `.env` or pass
   `--email`.
 - "Don't know the IMAP server for ...". Your provider is not one of the built-in

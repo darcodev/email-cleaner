@@ -20,6 +20,7 @@ from .scanner import (
     Filters,
     VALID_CATEGORIES,
     collect_unsubscribe_links,
+    imap_date,
     parse_age,
     scan,
     summarize_senders,
@@ -211,6 +212,47 @@ def _confirm_hosted_ai(classifier, args, allow_confirm: bool) -> bool:
     return True
 
 
+def _explain_no_matches(session: ImapSession, filters: Filters, folder: str) -> None:
+    """Say why an age-filtered run came back empty.
+
+    Almost always the same cause: --older-than is a minimum age and gets read
+    as a range, so the run asks for mail older than anything in the folder and
+    gets a truthful nothing. Two extra round trips beat a dead end, and they
+    only happen when there was nothing to report anyway.
+    """
+    cutoff = imap_date(filters.older_than_days)
+    ui.info(
+        f"Note: 'older than {filters.older_than_days} days' means mail that "
+        f"arrived before {cutoff} - not mail from the last "
+        f"{filters.older_than_days} days."
+    )
+    try:
+        uids = session.search_standard(["ALL"])
+        if not uids:
+            ui.info(f"'{folder}' has no messages at all.")
+            return
+        # STATUS counts the whole folder; the search only sees what the server
+        # puts in the selected view. Yahoo reports a 235k Inbox and then hands
+        # IMAP the newest 10000 of it, so saying "the oldest message in INBOX"
+        # off the search alone would be a confident lie.
+        held = session.folder_message_count(folder)
+        if held is not None and held > len(uids):
+            ui.warn(
+                f"'{folder}' holds {held:,} messages, but this server only "
+                f"exposes the newest {len(uids):,} of them over IMAP. Anything "
+                "older cannot be reached by any IMAP client, this one included."
+            )
+        # lowest UID is the oldest message, whatever order the server listed them
+        oldest = session.fetch_summaries([min(uids, key=int)])
+    except CleanerError:
+        return  # best effort - the run itself already finished
+    if oldest and oldest[0].date:
+        reach = "the oldest message" if held is None or held <= len(uids) else (
+            "the oldest message this server will show"
+        )
+        ui.info(f"{reach.capitalize()} in '{folder}' is from {oldest[0].date}.")
+
+
 def _run_scan(session: ImapSession, args, filters: Filters, classifier=None):
     ui.info(f"Searching '{args.folder}' ...")
     result = scan(
@@ -237,6 +279,8 @@ def _run_scan(session: ImapSession, args, filters: Filters, classifier=None):
             ui.info(f"AI kept {result.skipped_ai} message(s) it judged not a match.")
         if classifier.transport_error:
             ui.warn(f"{classifier.transport_error}; those messages were kept.")
+    if not result.emails and filters.older_than_days > 0:
+        _explain_no_matches(session, filters, args.folder)
     return result
 
 
@@ -437,9 +481,13 @@ def _prompt_menu(args) -> None:
     else:
         args.all = False  # promotions is the default (category stays unset)
 
-    ui.heading("How far back?")
-    print("  only touch mail older than this - e.g. 30d, 6m, 2y, or 0 for any age")
-    args.older_than = ui.prompt("Older than", default="30d")
+    ui.heading("How old does it have to be?")
+    # "How far back?" read as a range - people answered 5y meaning "search the
+    # last five years" and got nothing, because it is a floor: 5y asks for mail
+    # from before 2021 and most inboxes do not go back that far
+    print("  a minimum age, not a range - 6m means mail from MORE than six")
+    print("  months ago, and nothing newer. e.g. 30d, 6m, 2y. Use 0 for any age.")
+    args.older_than = ui.prompt("Only mail older than", default="30d")
 
     ui.heading("Narrow it down (optional, just hit Enter to skip)")
     args.keyword = _split_list(ui.prompt("Only mail containing these words", default=""))

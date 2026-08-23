@@ -32,6 +32,7 @@ _FETCH_PARTS = f"(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS {_HEADER_FIELDS}
 # the promotional filter runs on. Costs more bytes, so it is not the default.
 _FETCH_PARTS_FULL = "(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER])"
 
+_MESSAGES_RE = re.compile(r"MESSAGES (\d+)")
 _UID_RE = re.compile(rb"UID (\d+)")
 _SIZE_RE = re.compile(rb"RFC822\.SIZE (\d+)")
 _FLAGS_RE = re.compile(rb"FLAGS \(([^)]*)\)")
@@ -241,6 +242,10 @@ class ImapSession:
         # set when the purge could not be scoped to our own UIDs; the CLI reads
         # it after the run so the user hears what else it may have taken out
         self.expunge_notice: str | None = None
+        # what STATUS said a folder held just before we opened it. Yahoo gives
+        # the real total until the mailbox is selected and the size of its own
+        # windowed view afterwards, so open time is the only honest moment.
+        self._folder_totals: dict[str, int] = {}
 
     def connect(self) -> None:
         try:
@@ -351,7 +356,12 @@ class ImapSession:
         return self._imap
 
     def select(self, folder: str = "INBOX", readonly: bool = True) -> int:
-        """Open a folder, return how many messages it holds."""
+        """Open a folder, return how many messages the selected view exposes.
+
+        That is not always the same as how many the folder holds - see
+        folder_message_count, which is why the count is taken first.
+        """
+        held = self._status_message_count(folder)
         typ, data = self._conn().select(quoted_mailbox(folder), readonly=readonly)
         if typ != "OK":
             detail = (data[0] or b"").decode(errors="replace") if data else ""
@@ -360,6 +370,8 @@ class ImapSession:
                 hint="Use --folder to pick a folder that exists on your server.",
             )
         self.selected_folder = folder
+        if held is not None:
+            self._folder_totals[folder] = held
         try:
             return int(data[0])
         except (TypeError, ValueError):
@@ -461,6 +473,31 @@ class ImapSession:
             if on_progress:
                 on_progress(min(done, len(uids)), len(uids))
         return snippets
+
+    def _status_message_count(self, folder: str) -> int | None:
+        """Ask STATUS how many messages a folder holds. None if it will not say."""
+        try:
+            typ, data = self._conn().status(quoted_mailbox(folder), "(MESSAGES)")
+        except imaplib.IMAP4.error:
+            return None
+        if typ != "OK" or not data or not data[0]:
+            return None
+        found = _MESSAGES_RE.search(data[0].decode(errors="replace"))
+        return int(found.group(1)) if found else None
+
+    def folder_message_count(self, folder: str) -> int | None:
+        """How many messages the folder held when we opened it.
+
+        Worth knowing separately from what a search returns: the two disagree
+        on Yahoo, which reports a 235k-message Inbox and then exposes only the
+        newest 10000 of it to the selected view. Every search runs against the
+        smaller number, so a run that finds nothing is not evidence the mail is
+        not there. Asked before SELECT and remembered, because afterwards the
+        server answers with the size of the window instead of the folder.
+        """
+        if folder in self._folder_totals:
+            return self._folder_totals[folder]
+        return self._status_message_count(folder)
 
     def find_trash_folder(self, hint: str | None = None) -> str:
         """Find the Trash folder: preset hint, then the \\Trash flag, then guesses."""

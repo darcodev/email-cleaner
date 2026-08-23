@@ -56,6 +56,10 @@ from email_cleaner.scanner import (
 from email_cleaner.ui import colors_enabled, human_size, progress, truncate
 
 
+def _with_date(summary, date):
+    return dataclasses.replace(summary, date=date)
+
+
 def _mail(uid, sender="Shop <deals@shop.com>", subject="Sale!", unsub=None):
     name, _, addr = sender.partition(" <")
     return EmailSummary(
@@ -510,6 +514,15 @@ class _FakeConn:
     def expunge(self):
         self.calls.append(("EXPUNGE",))
         return "OK", [None]
+
+    def status(self, mailbox, names):
+        self.calls.append(("STATUS", mailbox, names))
+        return "NO", [None]
+
+    def select(self, mailbox, readonly=False):
+        self.calls.append(("SELECT", mailbox, readonly))
+        self.state = "SELECTED"
+        return "OK", [b"7"]
 
     def close(self):
         self.calls.append(("CLOSE",))
@@ -1323,6 +1336,82 @@ class TestEmptyTrashWhenNothingMatched(unittest.TestCase):
         rc, out = self._run(empty_trash=False)
         self.assertEqual(rc, 0)
         self.assertNotIn("Trash", " ".join(m for _, m in out))
+
+
+class TestEmptyResultIsExplained(unittest.TestCase):
+    """--older-than is a minimum age. Read as a range - "5y" meaning "the last
+    five years" - it asks for mail older than anything in the folder and gets a
+    truthful nothing, which looks like the tool is broken."""
+
+    class _Session:
+        supports_gmail_search = False
+
+        def __init__(self, oldest_date="2025-11-12", all_uids=("704344", "716330"),
+                     held=None):
+            self.all_uids = list(all_uids)
+            self.oldest_date = oldest_date
+            self.held = held
+            self.fetched = []
+
+        def folder_message_count(self, folder):
+            return self.held
+
+        def search_standard(self, criteria):
+            return self.all_uids if criteria == ["ALL"] else []
+
+        def fetch_summaries(self, uids, on_progress=None, full_headers=False):
+            self.fetched.append(list(uids))
+            return [_with_date(_mail(uids[0]), self.oldest_date)] if uids else []
+
+    def _capture(self, session, filters, folder="INBOX"):
+        out = []
+        with mock.patch.object(cli.ui, "info", lambda m: out.append(m)):
+            cli._explain_no_matches(session, filters, folder)
+        return " ".join(out)
+
+    def test_it_spells_out_what_the_age_actually_means(self):
+        text = self._capture(self._Session(), Filters(older_than_days=1825))
+        self.assertIn("arrived before", text)
+        self.assertIn("not mail from the last", text)
+
+    def test_it_names_the_oldest_message_in_the_folder(self):
+        session = self._Session(oldest_date="2025-11-12")
+        text = self._capture(session, Filters(older_than_days=1825))
+        self.assertIn("2025-11-12", text)
+        # the lowest uid is the oldest, whatever order the server listed them
+        self.assertEqual(session.fetched, [["704344"]])
+
+    def test_it_warns_when_the_server_hides_most_of_the_folder(self):
+        # Yahoo: STATUS says 235013, the selected view exposes 10000. Reporting
+        # the oldest of those as "the oldest message in INBOX" is a lie.
+        session = self._Session(all_uids=("704344", "716330"), held=235013)
+        out = []
+        with mock.patch.object(cli.ui, "info", lambda m: out.append(m)),                 mock.patch.object(cli.ui, "warn", lambda m: out.append(m)):
+            cli._explain_no_matches(session, Filters(older_than_days=1825), "INBOX")
+        text = " ".join(out)
+        self.assertIn("235,013", text)
+        self.assertIn("newest 2", text)
+        self.assertIn("this server will show", text)
+
+    def test_it_claims_the_real_oldest_when_nothing_is_hidden(self):
+        session = self._Session(all_uids=("704344", "716330"), held=2)
+        text = self._capture(session, Filters(older_than_days=1825))
+        self.assertIn("The oldest message in", text)
+        self.assertNotIn("will show", text)
+
+    def test_an_empty_folder_says_so(self):
+        session = self._Session(all_uids=())
+        self.assertIn("no messages at all", self._capture(session, Filters()))
+
+    def test_a_failing_probe_is_not_fatal(self):
+        session = self._Session()
+        session.search_standard = lambda c: (_ for _ in ()).throw(CleanerError("nope"))
+        self._capture(session, Filters())  # must not raise
+
+    def test_no_note_when_the_age_filter_is_off(self):
+        # scan() only calls this with an age set; guard the contract anyway
+        args = cli.build_parser().parse_args(["scan", "--older-than", "0"])
+        self.assertEqual(cli._make_filters(args).older_than_days, 0)
 
 
 class TestResolveAiSettings(unittest.TestCase):
