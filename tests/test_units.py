@@ -1276,6 +1276,55 @@ class TestMenuEmptyTrash(unittest.TestCase):
         self.assertFalse(getattr(args, "_empty_trash_confirmed", False))
 
 
+class TestEmptyTrashWhenNothingMatched(unittest.TestCase):
+    """The Trash prompt is answered before the scan runs. When the filters then
+    match nothing, cmd_clean returns early and never reaches the empty step -
+    so it has to say so, or a full-word 'yes' just vanishes."""
+
+    class _Session:
+        expunge_notice = None
+        supports_gmail_search = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def select(self, folder, readonly=True):
+            return 0
+
+        def search_standard(self, criteria):
+            return []
+
+        def fetch_summaries(self, uids, on_progress=None, full_headers=False):
+            return []
+
+        def empty_trash(self, *a, **k):
+            raise AssertionError("must not empty the Trash on an empty match set")
+
+    def _run(self, **flags):
+        args = cli.build_parser().parse_args(["clean", "--yes"])
+        for k, v in flags.items():
+            setattr(args, k, v)
+        out = []
+        acct = config.Account("me@x.com", "pw", "h", 993, "custom", None)
+        with mock.patch.object(cli.config, "resolve_account", lambda a: acct),                 mock.patch.object(cli, "ImapSession", lambda *a, **k: self._Session()),                 mock.patch.object(cli.ui, "warn", lambda m: out.append(("warn", m))),                 mock.patch.object(cli.ui, "ok", lambda m: out.append(("ok", m))),                 mock.patch.object(cli.ui, "info", lambda m: out.append(("info", m))),                 mock.patch("builtins.print", lambda *a, **k: None):
+            rc = cli.cmd_clean(args)
+        return rc, out
+
+    def test_it_says_the_trash_was_left_alone(self):
+        rc, out = self._run(empty_trash=True)
+        self.assertEqual(rc, 0)
+        warned = " ".join(m for kind, m in out if kind == "warn")
+        self.assertIn("Trash was left as it is", warned)
+
+    def test_no_such_note_when_the_trash_was_never_asked_about(self):
+        rc, out = self._run(empty_trash=False)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("Trash", " ".join(m for _, m in out))
+
+
 class TestResolveAiSettings(unittest.TestCase):
     KEYS = ("EMAIL_CLEANER_AI_BACKEND", "EMAIL_CLEANER_AI_MODEL",
             "EMAIL_CLEANER_AI_API_KEY", "EMAIL_CLEANER_AI_HOST",

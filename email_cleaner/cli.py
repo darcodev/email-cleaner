@@ -307,6 +307,14 @@ def cmd_clean(args) -> int:
         result = _run_scan(session, args, filters, classifier)
         _show_report(result, explain=args.ai_explain)
         if not result.emails:
+            if args.empty_trash:
+                # the full-word Trash prompt was answered before the scan ran.
+                # Going quiet here reads as "it emptied"; say plainly that it
+                # did not, because that answer was for a step we never reached.
+                ui.warn(
+                    "Nothing matched, so nothing moved - and the Trash was left "
+                    "as it is. Emptying it only runs after a move."
+                )
             return 0
 
         print()
