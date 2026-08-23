@@ -195,7 +195,13 @@ def _parse_fetch_response(data: list) -> list[EmailSummary]:
                 date=date_str,
                 size=int(size_m.group(1)) if size_m else 0,
                 flagged=b"\\Flagged" in flags,
-                unsubscribe=extract_unsubscribe_urls(msg.get("List-Unsubscribe", "")),
+                # decoded like the other headers: some senders RFC 2047-encode
+                # this one, which hides the angle brackets the URLs live in
+                # ('=3Chttps...=3E') and made the whole message read as not
+                # promotional - the one header the off-Gmail filter runs on
+                unsubscribe=extract_unsubscribe_urls(
+                    decode_mime_header(msg.get("List-Unsubscribe", ""))
+                ),
             )
         )
     return summaries

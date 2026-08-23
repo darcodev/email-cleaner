@@ -45,6 +45,7 @@ from email_cleaner.scanner import (
     Filters,
     _apply_ai,
     _apply_limit,
+    _drop_reason,
     build_gmail_query,
     build_standard_criteria,
     imap_date,
@@ -58,6 +59,9 @@ from email_cleaner.ui import colors_enabled, human_size, progress, truncate
 
 def _with_date(summary, date):
     return dataclasses.replace(summary, date=date)
+
+
+CRLF = chr(13) + chr(10)
 
 
 def _mail(uid, sender="Shop <deals@shop.com>", subject="Sale!", unsub=None):
@@ -454,6 +458,50 @@ class TestApplyLimit(unittest.TestCase):
 
     def test_negative_clamps_to_none_kept(self):
         self.assertEqual(_apply_limit(["1", "2", "3"], -5), [])
+
+
+class TestEncodedUnsubscribeHeader(unittest.TestCase):
+    """Some senders RFC 2047-encode List-Unsubscribe. The angle brackets the
+    URLs live in arrive as =3C and =3E, so the parser found no URLs and the
+    message read as not promotional - the one signal the off-Gmail filter has.
+    Subject and From were decoded on the way in; this header was not."""
+
+    ENCODED = (
+        "=?us-ascii?Q?=3Chttps=3A=2F=2Fmanage=2Ekmail-lists=2Ecom=2Funsub?="
+        + CRLF
+        + " =?us-ascii?Q?scribe=3Fa=3DHSutKw=3E?="
+    )
+    META = b"1 (UID 9 RFC822.SIZE 100 FLAGS () BODY[HEADER] {0}"
+
+    def _summary(self, header_value=None):
+        head = ["From: Shop <deals@shop.com>", "Subject: Sale"]
+        if header_value is not None:
+            head.append("List-Unsubscribe: " + header_value)
+        raw = (CRLF.join(head) + CRLF + CRLF).encode()
+        (summary,) = _parse_fetch_response([(self.META, raw)])
+        return summary
+
+    def test_an_encoded_header_still_yields_its_url(self):
+        summary = self._summary(self.ENCODED)
+        self.assertTrue(summary.unsubscribe, "encoded header read as no unsubscribe")
+        self.assertIn("kmail-lists.com", summary.unsubscribe[0])
+
+    def test_a_plain_header_is_unaffected(self):
+        summary = self._summary("<https://x.com/u>, <mailto:u@x.com>")
+        self.assertEqual(summary.unsubscribe, ["https://x.com/u", "mailto:u@x.com"])
+
+    def test_no_header_is_still_no_urls(self):
+        self.assertEqual(self._summary().unsubscribe, [])
+
+    def test_an_encoded_header_makes_the_message_promotional(self):
+        # the end that matters: this is what the fallback filter keys on, so
+        # every such sender was being skipped as "not marketing"
+        summary = self._summary(self.ENCODED)
+        self.assertIsNone(_drop_reason(summary, Filters(), local_promo=True))
+
+    def test_it_was_the_decode_that_was_missing(self):
+        self.assertEqual(extract_unsubscribe_urls(self.ENCODED), [])
+        self.assertTrue(extract_unsubscribe_urls(decode_mime_header(self.ENCODED)))
 
 
 class TestUnsubscribeParsing(unittest.TestCase):
