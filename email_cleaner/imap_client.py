@@ -16,7 +16,7 @@ import socket
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
-from .errors import CleanerError
+from .errors import CleanerError, SearchUnsupported
 
 # how many UIDs we put on a single IMAP command line. Bigger batches mean
 # fewer round trips (faster scans/moves), kept comfortably under the command
@@ -26,6 +26,11 @@ STORE_BATCH = 500
 
 _HEADER_FIELDS = "(FROM SUBJECT DATE LIST-UNSUBSCRIBE)"
 _FETCH_PARTS = f"(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS {_HEADER_FIELDS}])"
+# The whole header block, for servers that do not honour the field list above.
+# Yahoo returns FROM/SUBJECT/DATE and silently drops LIST-UNSUBSCRIBE from it,
+# which reads as "no marketing mail anywhere in this mailbox" - the one header
+# the promotional filter runs on. Costs more bytes, so it is not the default.
+_FETCH_PARTS_FULL = "(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER])"
 
 _UID_RE = re.compile(rb"UID (\d+)")
 _SIZE_RE = re.compile(rb"RFC822\.SIZE (\d+)")
@@ -363,12 +368,35 @@ class ImapSession:
     def search_gmail_raw(self, query: str) -> list[str]:
         # X-GM-RAW lets us hand Gmail its own search-box syntax
         args = search_args(["X-GM-RAW", quote_imap_string(query)])
-        typ, data = self._conn().uid("SEARCH", *args)
+        typ, data = self._uid_search(args)
         return self._search_result(typ, data)
 
     def search_standard(self, criteria: list[str]) -> list[str]:
-        typ, data = self._conn().uid("SEARCH", *search_args(criteria))
+        typ, data = self._uid_search(search_args(criteria))
         return self._search_result(typ, data)
+
+    def _uid_search(self, args: list) -> tuple:
+        """Run UID SEARCH, turning imaplib's exceptions into our own.
+
+        imaplib raises on a BAD reply from inside _command_complete, so the
+        status never reaches _search_result and its friendly message. A server
+        refusing a search term it does not implement answers exactly that way -
+        Yahoo returns "[CANNOT] ... not supported" for any HEADER search - and
+        the user got a raw traceback for something the tool can work around.
+        """
+        try:
+            return self._conn().uid("SEARCH", *args)
+        except imaplib.IMAP4.abort as exc:
+            # the connection itself is gone; retrying on it would only fail again
+            raise CleanerError(
+                f"The connection to {self.host} dropped mid-search ({exc}).",
+                hint="Run it again; if it keeps happening the server may be rate limiting.",
+            ) from exc
+        except imaplib.IMAP4.error as exc:
+            raise SearchUnsupported(
+                f"The server rejected this search ({exc}).",
+                hint="This server does not implement every IMAP search term.",
+            ) from exc
 
     @staticmethod
     def _search_result(typ: str, data: list) -> list[str]:
@@ -387,12 +415,23 @@ class ImapSession:
         return data[0].decode().split()
 
     def fetch_summaries(
-        self, uids: list[str], on_progress: Callable[[int, int], None] | None = None
+        self,
+        uids: list[str],
+        on_progress: Callable[[int, int], None] | None = None,
+        full_headers: bool = False,
     ) -> list[EmailSummary]:
+        """Header summaries for `uids`.
+
+        full_headers asks for the entire header block instead of the four
+        fields we actually read. Only worth it when the caller depends on
+        List-Unsubscribe and the server cannot be trusted to include it in a
+        HEADER.FIELDS list - see _FETCH_PARTS_FULL.
+        """
         summaries: list[EmailSummary] = []
         done = 0
+        parts = _FETCH_PARTS_FULL if full_headers else _FETCH_PARTS
         for batch in _chunks(uids, FETCH_BATCH):
-            typ, data = self._conn().uid("FETCH", ",".join(batch), _FETCH_PARTS)
+            typ, data = self._conn().uid("FETCH", ",".join(batch), parts)
             if typ != "OK":
                 raise CleanerError("Fetching message headers failed.")
             summaries.extend(_parse_fetch_response(data))

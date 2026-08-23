@@ -3,6 +3,7 @@
 Run with:  python -m unittest discover -s tests -v
 """
 
+import dataclasses
 import imaplib
 import json
 import os
@@ -25,7 +26,7 @@ from email_cleaner.ai import (
     _loads_lenient,
     _parse_verdicts,
 )
-from email_cleaner.errors import CleanerError
+from email_cleaner.errors import CleanerError, SearchUnsupported
 from email_cleaner.imap_client import (
     EmailSummary,
     ImapSession,
@@ -49,6 +50,7 @@ from email_cleaner.scanner import (
     imap_date,
     is_protected,
     parse_age,
+    scan,
     summarize_senders,
 )
 from email_cleaner.ui import colors_enabled, human_size, progress, truncate
@@ -270,6 +272,132 @@ class TestBlankFilterTerms(unittest.TestCase):
                           older_than_days=0, include_starred=True)
         self.assertEqual(filters.keywords, [])
         self.assertEqual(filters.from_senders, [])
+
+
+class _PickyServer:
+    """A server that refuses HEADER searches, the way Yahoo does, and drops
+    LIST-UNSUBSCRIBE from a HEADER.FIELDS fetch while still holding it."""
+
+    supports_gmail_search = False
+
+    def __init__(self, mail, refuse_header=True, hide_unsub_in_fields=True):
+        self.mail = mail
+        self.refuse_header = refuse_header
+        self.hide_unsub_in_fields = hide_unsub_in_fields
+        self.searches = []
+        self.full_header_fetches = []
+
+    def search_standard(self, criteria):
+        self.searches.append(list(criteria))
+        if self.refuse_header and "HEADER" in criteria:
+            raise SearchUnsupported("the server rejected this search (BAD)")
+        return [m.uid for m in self.mail]
+
+    def fetch_summaries(self, uids, on_progress=None, full_headers=False):
+        self.full_header_fetches.append(full_headers)
+        out = []
+        for m in self.mail:
+            if m.uid not in uids:
+                continue
+            if not full_headers and self.hide_unsub_in_fields:
+                m = dataclasses.replace(m, unsubscribe=[])
+            out.append(m)
+        return out
+
+
+def _promo(uid, unsub=True):
+    return _mail(uid, unsub=["https://x.com/u"] if unsub else [])
+
+
+class TestHeaderSearchFallback(unittest.TestCase):
+    """Yahoo answers any HEADER search with BAD, and that test is the whole of
+    the promotional rule off Gmail. Rather than fail the run, scan() searches
+    on what the server does accept and applies List-Unsubscribe on our side."""
+
+    def test_criteria_can_be_built_without_the_header_term(self):
+        crit = build_standard_criteria(Filters(), promo_via_header=False)
+        self.assertNotIn("HEADER", crit)
+        self.assertNotIn("List-Unsubscribe", crit)
+        self.assertIn("BEFORE", crit)
+
+    def test_falls_back_and_filters_on_our_side(self):
+        server = _PickyServer([_promo("1"), _promo("2", unsub=False), _promo("3")])
+        res = scan(server, Filters())
+        self.assertEqual([e.uid for e in res.emails], ["1", "3"])
+        self.assertEqual(res.skipped_not_promo, 1)
+        # first attempt used HEADER, the retry did not
+        self.assertIn("HEADER", server.searches[0])
+        self.assertNotIn("HEADER", server.searches[1])
+
+    def test_the_fallback_asks_for_the_whole_header_block(self):
+        # the narrow field list is exactly what comes back without the header
+        server = _PickyServer([_promo("1")])
+        res = scan(server, Filters())
+        self.assertEqual(server.full_header_fetches, [True])
+        self.assertEqual([e.uid for e in res.emails], ["1"])
+
+    def test_a_working_server_keeps_the_narrow_fetch(self):
+        server = _PickyServer([_promo("1")], refuse_header=False)
+        scan(server, Filters())
+        self.assertEqual(server.searches, [build_standard_criteria(Filters())])
+        self.assertEqual(server.full_header_fetches, [False])
+
+    def test_limit_counts_matches_not_candidates(self):
+        # the server hands back everything old, so capping before the promo
+        # filter would give fewer than --limit asked for
+        mail = [_promo("1", unsub=False), _promo("2"), _promo("3", unsub=False), _promo("4")]
+        res = scan(_PickyServer(mail), Filters(limit=2))
+        self.assertEqual([e.uid for e in res.emails], ["2", "4"])
+
+    def test_protected_senders_still_win_on_the_fallback(self):
+        mail = [_promo("1"), _promo("2")]
+        mail[0] = dataclasses.replace(mail[0], sender_email="deals@amazon.com")
+        res = scan(_PickyServer(mail), Filters(protected_senders=["amazon.com"]))
+        self.assertEqual([e.uid for e in res.emails], ["2"])
+        self.assertEqual(res.skipped_protected, 1)
+
+    def test_all_has_nothing_to_fall_back_to(self):
+        # --all sends no HEADER term, so a refusal here is a real failure
+        server = _PickyServer([_promo("1")])
+        server.search_standard = lambda c: (_ for _ in ()).throw(
+            SearchUnsupported("nope")
+        )
+        with self.assertRaises(SearchUnsupported):
+            scan(server, Filters(promo_only=False))
+
+    def test_the_description_says_where_the_filtering_happened(self):
+        res = scan(_PickyServer([_promo("1")]), Filters())
+        self.assertIn("unsubscribe header checked on this machine", res.query_description)
+
+
+class TestSearchErrorsAreCatchable(unittest.TestCase):
+    """imaplib raises on a BAD reply before the status reaches _search_result,
+    so a refused search used to surface as a traceback."""
+
+    def _session(self, exc):
+        session, conn = _fake_session()
+        conn.uid = mock.Mock(side_effect=exc)
+        return session
+
+    def test_bad_becomes_search_unsupported(self):
+        session = self._session(imaplib.IMAP4.error("BAD [CANNOT] not supported"))
+        with self.assertRaises(SearchUnsupported):
+            session.search_standard(["HEADER", "List-Unsubscribe", chr(34) * 2])
+
+    def test_search_unsupported_still_prints_like_any_other_error(self):
+        self.assertTrue(issubclass(SearchUnsupported, CleanerError))
+
+    def test_a_dropped_connection_is_not_mistaken_for_a_refusal(self):
+        session = self._session(imaplib.IMAP4.abort("socket error"))
+        with self.assertRaises(CleanerError) as caught:
+            session.search_standard(["ALL"])
+        self.assertNotIsInstance(caught.exception, SearchUnsupported)
+        self.assertIn("dropped", str(caught.exception))
+
+    def test_gmail_search_is_guarded_too(self):
+        session = self._session(imaplib.IMAP4.error("BAD"))
+        with self.assertRaises(SearchUnsupported):
+            session.search_gmail_raw("category:promotions")
 
 
 class TestProtection(unittest.TestCase):

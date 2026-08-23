@@ -225,6 +225,13 @@ def _run_scan(session: ImapSession, args, filters: Filters, classifier=None):
             f"Skipped {result.skipped_protected} protected and "
             f"{result.skipped_starred} starred message(s)."
         )
+    if result.skipped_not_promo:
+        # only ever set on the fallback path, where the count would otherwise
+        # look mysteriously small next to what the server was asked for
+        ui.info(
+            f"This server can't search mail headers, so {result.skipped_not_promo} "
+            "non-promotional message(s) were filtered out here instead."
+        )
     if classifier is not None:
         if result.skipped_ai:
             ui.info(f"AI kept {result.skipped_ai} message(s) it judged not a match.")

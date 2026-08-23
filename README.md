@@ -273,6 +273,14 @@ instead matches mail that carries a `List-Unsubscribe` header - the standard
 header that bulk and marketing senders are required to include. That is a good
 proxy for "this is a mailing-list message" and rarely catches personal mail.
 
+Some servers will not run a header search at all. Yahoo answers any `HEADER`
+search with "not supported", and it also leaves `List-Unsubscribe` out of a
+partial header fetch even when the message has one. Where that happens the tool
+searches on what the server does accept (age, sender, keyword, unread state),
+fetches the full header block, and applies the `List-Unsubscribe` test on your
+machine instead. The result is the same set of mail; it just costs a wider
+header fetch, and the run tells you how many messages were filtered out locally.
+
 `--all` turns this promotional detection off and matches everything your other
 filters allow, which is useful for jobs like "delete every message from this one
 sender" regardless of whether it looks promotional.
@@ -498,6 +506,13 @@ can fix yourself. The common ones:
   Pass an existing one with `--folder`.
 - "Could not find your Trash folder". Auto-detection did not find it, usually on
   a non-standard or non-English server. Pass it with `--trash-folder`.
+- "The server rejected this search". The server does not implement one of the
+  IMAP search terms. The tool works around this for the promotional filter (see
+  [above](#how-it-decides-what-is-promotional)); if you hit it with `--all`,
+  drop a filter and try again.
+- Fewer matches than you expect on Yahoo. Yahoo caps a single IMAP `SEARCH` at
+  1000 results, so a large mailbox is cleaned 1000 at a time. Run it again until
+  it comes back empty.
 - "No email address configured". Set `EMAIL_CLEANER_EMAIL` in `.env` or pass
   `--email`.
 - "Don't know the IMAP server for ...". Your provider is not one of the built-in

@@ -11,10 +11,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from .errors import CleanerError
+from .errors import CleanerError, SearchUnsupported
 from .imap_client import EmailSummary, ImapSession, quote_imap_string
 
 VALID_CATEGORIES = ("promotions", "social", "updates", "forums")
+
+# appended to the query description when the server could not run the
+# List-Unsubscribe test and we had to apply it to the fetched headers instead
+_PROMO_LOCAL_NOTE = "(unsubscribe header checked on this machine)"
 
 # month names for the IMAP date format (02-Jul-2026), locale-independent
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -144,10 +148,15 @@ def _or_group(key: str, values: list[str]) -> list[str]:
     return crit
 
 
-def build_standard_criteria(filters: Filters) -> list[str]:
-    """Plain IMAP SEARCH criteria for servers without gmail extensions."""
+def build_standard_criteria(filters: Filters, promo_via_header: bool = True) -> list[str]:
+    """Plain IMAP SEARCH criteria for servers without gmail extensions.
+
+    promo_via_header=False leaves the List-Unsubscribe test out, for servers
+    that refuse HEADER searches. scan() then applies that half of the filter
+    to the fetched headers instead - see _PROMO_LOCAL_NOTE.
+    """
     criteria = []
-    if filters.promo_only:
+    if filters.promo_only and promo_via_header:
         criteria += ["HEADER", "List-Unsubscribe", '""']
     if filters.older_than_days > 0:
         criteria += ["BEFORE", imap_date(filters.older_than_days)]
@@ -179,6 +188,9 @@ class ScanResult:
     skipped_protected: int = 0
     skipped_starred: int = 0
     skipped_ai: int = 0
+    # non-promotional mail dropped here rather than by the server, on servers
+    # that cannot run the List-Unsubscribe HEADER search themselves
+    skipped_not_promo: int = 0
     # uid -> the model's one-line reason, for the messages it kept for deletion
     ai_reasons: dict[str, str] = field(default_factory=dict)
 
@@ -187,12 +199,13 @@ class ScanResult:
         return sum(e.size for e in self.emails)
 
 
-def _apply_limit(uids: list[str], limit: int | None) -> list[str]:
-    """Keep at most `limit` matches (the oldest, since UIDs arrive oldest
-    first). None means no cap; 0 means keep none. Negatives clamp to 0."""
+def _apply_limit(items: list, limit: int | None) -> list:
+    """Keep at most `limit` matches (the oldest, since UIDs and the summaries
+    built from them are both oldest-first). None means no cap; 0 means keep
+    none. Negatives clamp to 0."""
     if limit is None:
-        return uids
-    return uids[: max(limit, 0)]
+        return items
+    return items[: max(limit, 0)]
 
 
 def _apply_ai(candidates, classifier, snippets, on_progress):
@@ -229,6 +242,7 @@ def scan(
     safety net (protected/starred), so only the already-narrowed candidates are
     ever sent to it. The pass can only narrow the set further, never widen it.
     """
+    local_promo = False  # set when the server made us filter promos on our side
     if session.supports_gmail_search:
         query = build_gmail_query(filters)
         if query:
@@ -240,12 +254,38 @@ def scan(
             description = "all messages in the folder"
     else:
         criteria = build_standard_criteria(filters)
-        uids = session.search_standard(criteria)
+        try:
+            uids = session.search_standard(criteria)
+        except SearchUnsupported:
+            # Yahoo, and any other server without HEADER search, refuses the
+            # List-Unsubscribe test outright. That test is the whole of our
+            # "this is promotional" rule off Gmail, so rather than fail the run
+            # we search on what the server does accept and apply the header
+            # half ourselves, below. It costs a wider header fetch, because the
+            # servers that land here are also the ones that leave the header
+            # out of a HEADER.FIELDS reply.
+            if not filters.promo_only:
+                raise  # nothing to fall back to; the terms themselves are refused
+            criteria = build_standard_criteria(filters, promo_via_header=False)
+            uids = session.search_standard(criteria)
+            local_promo = True
         description = "IMAP search: " + " ".join(criteria)
+        if local_promo:
+            description += " " + _PROMO_LOCAL_NOTE
 
-    uids = _apply_limit(uids, filters.limit)
+    # with the fallback the server hands back more than we want, so the cap has
+    # to wait until the non-promotional mail has been dropped - otherwise
+    # --limit 100 would trim to 100 candidates and then keep only the promos
+    # among them, which is not what "stop after this many matches" promises
+    if not local_promo:
+        uids = _apply_limit(uids, filters.limit)
 
-    summaries = session.fetch_summaries(uids, on_progress=on_progress)
+    # the fallback filters on List-Unsubscribe here, so it needs a fetch that
+    # actually carries it - the narrow field list comes back without it on the
+    # very servers that send us down this path
+    summaries = session.fetch_summaries(
+        uids, on_progress=on_progress, full_headers=local_promo
+    )
 
     # belt and suspenders: the server already filtered, but re-check protect
     # and starred here in case its search handed back something it shouldnt.
@@ -254,7 +294,13 @@ def scan(
     kept: list[EmailSummary] = []
     skipped_protected = 0
     skipped_starred = 0
+    skipped_not_promo = 0
     for s in summaries:
+        # the server could not do this one, so it happens here: no unsubscribe
+        # header means it is not the bulk mail the promotional filter asked for
+        if local_promo and not s.unsubscribe:
+            skipped_not_promo += 1
+            continue
         if is_protected(s, filters.protected_senders):
             skipped_protected += 1
             continue
@@ -262,6 +308,9 @@ def scan(
             skipped_starred += 1
             continue
         kept.append(s)
+
+    if local_promo:
+        kept = _apply_limit(kept, filters.limit)
 
     # AI pass runs last and only on the survivors, so protected and starred mail
     # is never sent to it (and a hosted backend only ever sees the candidates).
@@ -279,6 +328,7 @@ def scan(
         skipped_protected=skipped_protected,
         skipped_starred=skipped_starred,
         skipped_ai=skipped_ai,
+        skipped_not_promo=skipped_not_promo,
         ai_reasons=ai_reasons,
     )
 
