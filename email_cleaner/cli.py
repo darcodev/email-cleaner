@@ -3,7 +3,7 @@
 Commands:
   scan          show what would be cleaned (default, read-only)
   clean         move matching email to Trash (or delete with --permanent)
-  unsubscribe   export unsubscribe links for your noisiest senders
+  unsubscribe   list unsubscribe links for your noisiest senders (never opens them)
 """
 
 from __future__ import annotations
@@ -185,7 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     unsub = sub.add_parser(
         "unsubscribe",
         parents=[common],
-        help="export unsubscribe links for the senders that mail you most",
+        help=(
+            "list the unsubscribe links from the senders that mail you most, so "
+            "you can use them yourself - this never opens or follows a link"
+        ),
     )
     unsub.add_argument("--output", metavar="FILE", help="also write the links to a file")
     return parser

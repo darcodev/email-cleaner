@@ -371,7 +371,13 @@ class TestHeaderSearchFallback(unittest.TestCase):
 
     def test_the_description_says_where_the_filtering_happened(self):
         res = scan(_PickyServer([_promo("1")]), Filters())
-        self.assertIn("unsubscribe header checked on this machine", res.query_description)
+        self.assertIn("promotional test applied here", res.query_description)
+
+    def test_the_description_cannot_be_read_as_having_unsubscribed_anyone(self):
+        # it was: "(unsubscribe header checked on this machine)", which a user
+        # reasonably read as the tool having unsubscribed them from their lists
+        res = scan(_PickyServer([_promo("1")]), Filters())
+        self.assertNotIn("unsubscribe", res.query_description.lower())
 
 
 class TestSearchErrorsAreCatchable(unittest.TestCase):

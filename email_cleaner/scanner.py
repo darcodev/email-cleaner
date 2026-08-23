@@ -21,9 +21,12 @@ from .imap_client import (
 
 VALID_CATEGORIES = ("promotions", "social", "updates", "forums")
 
-# appended to the query description when the server could not run the
-# List-Unsubscribe test and we had to apply it to the fetched headers instead
-_PROMO_LOCAL_NOTE = "(unsubscribe header checked on this machine)"
+# Appended to the query description when the server could not run the
+# List-Unsubscribe test and we had to apply it to the fetched headers instead.
+# Worded as a test that was applied, not as a thing that was done to the mail:
+# "unsubscribe header checked on this machine" was read as the tool having
+# unsubscribed someone from their mailing lists, which it has never done.
+_PROMO_LOCAL_NOTE = "(promotional test applied here, not on the server)"
 
 # month names for the IMAP date format (02-Jul-2026), locale-independent
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
