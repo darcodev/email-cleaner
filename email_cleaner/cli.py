@@ -277,6 +277,7 @@ def _run_scan(session: ImapSession, args, filters: Filters, classifier=None):
         on_progress=lambda d, t: ui.progress(d, t, "Reading headers"),
         classifier=classifier,
         on_ai_progress=lambda d, t: ui.progress(d, t, "Classifying"),
+        on_notice=ui.info,
     )
     if result.skipped_protected or result.skipped_starred:
         ui.info(

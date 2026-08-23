@@ -239,6 +239,10 @@ def _fetch_until_enough(session, uids: list[str], filters: Filters, on_progress)
     wanted = max(filters.limit or 0, 0)
     out: list[EmailSummary] = []
     survivors = 0
+    # this path drives progress itself, so it owns the opening tick too -
+    # otherwise the first chunk is several more seconds of blank terminal
+    if on_progress and uids:
+        on_progress(0, len(uids))
     for start in range(0, len(uids), FULL_FETCH_BATCH):
         chunk = uids[start : start + FULL_FETCH_BATCH]
         batch = session.fetch_summaries(chunk, full_headers=True)
@@ -278,6 +282,7 @@ def scan(
     on_progress=None,
     classifier=None,
     on_ai_progress=None,
+    on_notice=None,
 ) -> ScanResult:
     """Search the selected folder and return everything that matched.
 
@@ -309,6 +314,14 @@ def scan(
             # out of a HEADER.FIELDS reply.
             if not filters.promo_only:
                 raise  # nothing to fall back to; the terms themselves are refused
+            if on_notice:
+                # the retry and the wider fetch it forces are most of the wait
+                # before anything else prints, so say why it is happening
+                on_notice(
+                    "This server can't search message headers, so the "
+                    "promotional filter runs here instead - that means reading "
+                    "more headers, which takes a little longer."
+                )
             criteria = build_standard_criteria(filters, promo_via_header=False)
             uids = session.search_standard(criteria)
             local_promo = True

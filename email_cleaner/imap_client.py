@@ -448,6 +448,11 @@ class ImapSession:
         done = 0
         parts = _FETCH_PARTS_FULL if full_headers else _FETCH_PARTS
         size = FULL_FETCH_BATCH if full_headers else FETCH_BATCH
+        # say we have started before the first batch, not after it: on a slow
+        # server the first chunk is seconds of otherwise blank terminal, which
+        # is exactly long enough for someone to conclude it has hung
+        if on_progress and uids:
+            on_progress(0, len(uids))
         for batch in _chunks(uids, size):
             typ, data = self._conn().uid("FETCH", ",".join(batch), parts)
             if typ != "OK":
