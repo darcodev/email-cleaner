@@ -576,6 +576,12 @@ def _prompt_menu(args) -> None:
     args.from_senders = _split_list(ui.prompt("Only from these senders/domains", default=""))
     args.protect = _split_list(ui.prompt("Never touch these senders", default=""))
 
+    ui.heading("One pass, or keep going?")
+    print("  some servers only show part of a folder at a time - Yahoo shows the")
+    print("  newest 10000 - so one pass can only reach so far back. Repeating lets")
+    print("  older mail into view as the mail you clean leaves the folder.")
+    args.repeat = ui.confirm("Keep going until nothing matches?")
+
     # answering here is what lets cmd_clean skip its own gate later, so this has
     # to be the same 'type yes in full' one the --empty-trash flag gets - a
     # stray 'y' at a menu must not be enough to wipe the whole Trash folder

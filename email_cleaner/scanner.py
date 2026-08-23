@@ -12,7 +12,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from .errors import CleanerError, SearchUnsupported
-from .imap_client import EmailSummary, ImapSession, quote_imap_string
+from .imap_client import (
+    FULL_FETCH_BATCH,
+    EmailSummary,
+    ImapSession,
+    quote_imap_string,
+)
 
 VALID_CATEGORIES = ("promotions", "social", "updates", "forums")
 
@@ -208,6 +213,44 @@ def _apply_limit(items: list, limit: int | None) -> list:
     return items[: max(limit, 0)]
 
 
+def _drop_reason(summary: EmailSummary, filters: Filters, local_promo: bool) -> str | None:
+    """Why this message is not a candidate, or None if it survives.
+
+    One place, so the early-exit fetch below and the tally in scan() cannot
+    drift apart about what counts as a match.
+    """
+    if local_promo and not summary.unsubscribe:
+        return "not_promo"
+    if is_protected(summary, filters.protected_senders):
+        return "protected"
+    if summary.flagged and not filters.include_starred:
+        return "starred"
+    return None
+
+
+def _fetch_until_enough(session, uids: list[str], filters: Filters, on_progress):
+    """Fetch full headers in chunks, stopping once --limit is satisfied.
+
+    Only for the fallback path, where the server hands back every candidate and
+    the promotional test happens here. A small --limit is usually satisfied in
+    the first chunk, so fetching all of them - at roughly twelve times the bytes
+    of a normal header fetch - is a long wait for a result already in hand.
+    """
+    wanted = max(filters.limit or 0, 0)
+    out: list[EmailSummary] = []
+    survivors = 0
+    for start in range(0, len(uids), FULL_FETCH_BATCH):
+        chunk = uids[start : start + FULL_FETCH_BATCH]
+        batch = session.fetch_summaries(chunk, full_headers=True)
+        out.extend(batch)
+        survivors += sum(1 for s in batch if _drop_reason(s, filters, True) is None)
+        if on_progress:
+            on_progress(min(start + len(chunk), len(uids)), len(uids))
+        if survivors >= wanted:
+            break
+    return out
+
+
 def _apply_ai(candidates, classifier, snippets, on_progress):
     """Narrow the candidate set with the model's keep-or-delete verdicts.
 
@@ -283,31 +326,28 @@ def scan(
     # the fallback filters on List-Unsubscribe here, so it needs a fetch that
     # actually carries it - the narrow field list comes back without it on the
     # very servers that send us down this path
-    summaries = session.fetch_summaries(
-        uids, on_progress=on_progress, full_headers=local_promo
-    )
+    if local_promo and filters.limit is not None:
+        summaries = _fetch_until_enough(session, uids, filters, on_progress)
+    else:
+        summaries = session.fetch_summaries(
+            uids, on_progress=on_progress, full_headers=local_promo
+        )
 
     # belt and suspenders: the server already filtered, but re-check protect
     # and starred here in case its search handed back something it shouldnt.
     # single pass keeps survivors and tallies drops at once, so is_protected
     # runs once per message instead of up to three times.
     kept: list[EmailSummary] = []
-    skipped_protected = 0
-    skipped_starred = 0
-    skipped_not_promo = 0
+    dropped = {"not_promo": 0, "protected": 0, "starred": 0}
     for s in summaries:
-        # the server could not do this one, so it happens here: no unsubscribe
-        # header means it is not the bulk mail the promotional filter asked for
-        if local_promo and not s.unsubscribe:
-            skipped_not_promo += 1
-            continue
-        if is_protected(s, filters.protected_senders):
-            skipped_protected += 1
-            continue
-        if s.flagged and not filters.include_starred:
-            skipped_starred += 1
+        reason = _drop_reason(s, filters, local_promo)
+        if reason:
+            dropped[reason] += 1
             continue
         kept.append(s)
+    skipped_protected = dropped["protected"]
+    skipped_starred = dropped["starred"]
+    skipped_not_promo = dropped["not_promo"]
 
     if local_promo:
         kept = _apply_limit(kept, filters.limit)

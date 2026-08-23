@@ -23,6 +23,11 @@ from .errors import CleanerError, SearchUnsupported
 # line length most servers accept.
 FETCH_BATCH = 1000
 STORE_BATCH = 500
+# A full header block is an order of magnitude more data per message than the
+# four fields we normally ask for, so those go in much smaller batches. Progress
+# is reported per batch, and one batch of 1000 full headers is over half a
+# minute of an entirely silent terminal - long enough to look hung and be killed.
+FULL_FETCH_BATCH = 100
 
 _HEADER_FIELDS = "(FROM SUBJECT DATE LIST-UNSUBSCRIBE)"
 _FETCH_PARTS = f"(UID RFC822.SIZE FLAGS BODY.PEEK[HEADER.FIELDS {_HEADER_FIELDS}])"
@@ -442,7 +447,8 @@ class ImapSession:
         summaries: list[EmailSummary] = []
         done = 0
         parts = _FETCH_PARTS_FULL if full_headers else _FETCH_PARTS
-        for batch in _chunks(uids, FETCH_BATCH):
+        size = FULL_FETCH_BATCH if full_headers else FETCH_BATCH
+        for batch in _chunks(uids, size):
             typ, data = self._conn().uid("FETCH", ",".join(batch), parts)
             if typ != "OK":
                 raise CleanerError("Fetching message headers failed.")
