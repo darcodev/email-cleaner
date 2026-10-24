@@ -21,8 +21,11 @@ class SearchUnsupported(CleanerError):
 class ConnectionLost(CleanerError):
     """The server hung up mid-command (an IMAP BYE / imaplib abort).
 
-    Recoverable in a way most errors are not: every pass re-runs its own
-    search, so nothing is half-done that a reconnect cannot simply redo.
-    Yahoo drops long sessions like this once a run has moved a few hundred
-    messages, which is exactly when giving up would waste the most work.
+    A new search can usually resume the cleanup. Copy-based moves are an
+    exception: the copy may have landed while the source is still present, so
+    retrying could create duplicates. Those losses have retry_safe=False.
     """
+
+    def __init__(self, message: str, hint: str | None = None, *, retry_safe: bool = True):
+        super().__init__(message, hint=hint)
+        self.retry_safe = retry_safe

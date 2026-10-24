@@ -279,8 +279,11 @@ Long runs get hung up on. Yahoo closes the session after a few hundred moved
 messages, which arrives as an IMAP `BYE` mid-command. A `--repeat` run
 reconnects and carries on, up to five times - safe to do because each pass runs
 its own search, so anything already moved stays moved and the rest is simply
-found again. If the reconnects run out, the run reports what it managed and
-exits `2` rather than claiming success.
+found again. If the reconnects run out or the last allowed pass loses its
+connection, the run reports what it managed and exits `2` rather than claiming
+success. On older servers without atomic `MOVE`, a drop during the copy-based
+move stops the run instead: some messages may be in both folders, so check the
+source and Trash before retrying to avoid duplicate copies.
 
 Two things worth knowing before leaning on it. The window only advances as far
 as you empty it, so anything you keep stays in the way: if 40% of your mail is

@@ -365,7 +365,7 @@ class ImapSession:
         self._imap = None
 
     @contextlib.contextmanager
-    def _alive(self, doing: str):
+    def _alive(self, doing: str, *, retry_safe: bool = True):
         """Turn "the server hung up" into something callers can act on.
 
         imaplib raises abort from deep inside _command_complete when it reads a
@@ -373,11 +373,17 @@ class ImapSession:
         """
         try:
             yield
-        except imaplib.IMAP4.abort as exc:
+        except (imaplib.IMAP4.abort, OSError) as exc:
             self._lost = True
             raise ConnectionLost(
                 f"The server closed the connection while {doing} ({exc}).",
-                hint="Servers cut long sessions off; running it again resumes.",
+                hint=(
+                    "Servers cut long sessions off; running it again resumes."
+                    if retry_safe else
+                    "Some messages may be in both folders. Check the source and "
+                    "Trash before retrying to avoid duplicate copies."
+                ),
+                retry_safe=retry_safe,
             ) from exc
 
     def reconnect(self) -> None:
@@ -405,7 +411,8 @@ class ImapSession:
         folder_message_count, which is why the count is taken first.
         """
         held = self._status_message_count(folder)
-        typ, data = self._conn().select(quoted_mailbox(folder), readonly=readonly)
+        with self._alive(f"opening folder '{folder}'"):
+            typ, data = self._conn().select(quoted_mailbox(folder), readonly=readonly)
         if typ != "OK":
             detail = (data[0] or b"").decode(errors="replace") if data else ""
             raise CleanerError(
@@ -446,7 +453,7 @@ class ImapSession:
         """
         try:
             return self._conn().uid("SEARCH", *args)
-        except imaplib.IMAP4.abort as exc:
+        except (imaplib.IMAP4.abort, OSError) as exc:
             # the connection itself is gone; retrying on it would only fail again
             self._lost = True
             raise ConnectionLost(
@@ -534,7 +541,8 @@ class ImapSession:
     def _status_message_count(self, folder: str) -> int | None:
         """Ask STATUS how many messages a folder holds. None if it will not say."""
         try:
-            typ, data = self._conn().status(quoted_mailbox(folder), "(MESSAGES)")
+            with self._alive(f"reading the message count for '{folder}'"):
+                typ, data = self._conn().status(quoted_mailbox(folder), "(MESSAGES)")
         except imaplib.IMAP4.error:
             return None
         if typ != "OK" or not data or not data[0]:
@@ -562,7 +570,8 @@ class ImapSession:
 
         candidates = [hint] if hint else []
         try:
-            typ, listing = conn.list()
+            with self._alive("finding the Trash folder"):
+                typ, listing = conn.list()
             if typ == "OK":
                 for line in listing or []:
                     if not isinstance(line, bytes):
@@ -582,7 +591,8 @@ class ImapSession:
         for name in candidates:
             if not name:
                 continue
-            typ, _ = conn.status(quoted_mailbox(name), "(MESSAGES)")
+            with self._alive("finding the Trash folder"):
+                typ, _ = conn.status(quoted_mailbox(name), "(MESSAGES)")
             if typ == "OK":
                 return name
         raise CleanerError(
@@ -590,7 +600,7 @@ class ImapSession:
             hint="Pass it explicitly with --trash-folder.",
         )
 
-    def _expunge(self, uids: list[str]) -> None:
+    def _expunge(self, uids: list[str], *, retry_safe: bool = True) -> None:
         """Purge the messages we just flagged \\Deleted - and only those.
 
         A bare EXPUNGE removes *every* \\Deleted message in the open folder,
@@ -605,20 +615,27 @@ class ImapSession:
         conn = self._conn()
         if self.supports_uid_expunge:
             for batch in _chunks(uids, STORE_BATCH):
-                typ, _ = conn.uid("EXPUNGE", ",".join(batch))
+                with self._alive("purging deleted messages", retry_safe=retry_safe):
+                    typ, _ = conn.uid("EXPUNGE", ",".join(batch))
                 if typ != "OK":
-                    # they are flagged, just still there; the next run picks
-                    # them up. Better than reporting a delete that didn't happen
-                    self.expunge_notice = (
-                        "the server refused UID EXPUNGE, so some messages are "
-                        "marked deleted but still in the folder"
+                    raise CleanerError(
+                        "The server refused UID EXPUNGE. Some messages are "
+                        "marked deleted but are still in the folder.",
+                        hint="The cleanup is incomplete; check the folder before retrying.",
                     )
             return
+        with self._alive("purging deleted messages", retry_safe=retry_safe):
+            typ, _ = conn.expunge()
+        if typ != "OK":
+            raise CleanerError(
+                "The server refused EXPUNGE. Messages are marked deleted "
+                "but are still in the folder.",
+                hint="The cleanup is incomplete; check the folder before retrying.",
+            )
         self.expunge_notice = (
             "this server has no UID EXPUNGE, so any messages another mail app "
             "had already flagged deleted in this folder were purged too"
         )
-        conn.expunge()
 
     def move_to_trash(
         self,
@@ -638,7 +655,7 @@ class ImapSession:
         can_move = self.supports_move
         for batch in _chunks(uids, STORE_BATCH):
             uid_set = ",".join(batch)
-            with self._alive(f"moving messages to '{trash_folder}'"):
+            with self._alive(f"moving messages to '{trash_folder}'", retry_safe=can_move):
                 if can_move:
                     typ, data = conn.uid("MOVE", uid_set, quoted_trash)
                 else:
@@ -652,7 +669,8 @@ class ImapSession:
             if not can_move:
                 # the copy landed, so a failure here leaves the message in both
                 # places - worth stopping for rather than quietly duplicating
-                typ, _ = conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
+                with self._alive(f"removing messages copied to '{trash_folder}'", retry_safe=False):
+                    typ, _ = conn.uid("STORE", uid_set, "+FLAGS.SILENT", "(\\Deleted)")
                 if typ != "OK":
                     raise CleanerError(
                         f"Copied {len(batch)} message(s) to '{trash_folder}' but "
@@ -665,7 +683,7 @@ class ImapSession:
                 on_progress(moved, len(uids))
         if not can_move:
             # MOVE expunges as it goes; only the copy fallback needs this
-            self._expunge(uids)
+            self._expunge(uids, retry_safe=False)
         return moved
 
     def delete_permanently(
@@ -704,7 +722,8 @@ class ImapSession:
             return 0
         removed = 0
         for batch in _chunks(uids, STORE_BATCH):
-            typ, _ = conn.uid("STORE", ",".join(batch), "+FLAGS.SILENT", "(\\Deleted)")
+            with self._alive(f"emptying '{trash_folder}'"):
+                typ, _ = conn.uid("STORE", ",".join(batch), "+FLAGS.SILENT", "(\\Deleted)")
             if typ != "OK":
                 raise CleanerError(
                     f"Emptying '{trash_folder}' failed after {removed} message(s)."
@@ -714,7 +733,14 @@ class ImapSession:
                 on_progress(removed, len(uids))
         # every message in the folder is flagged at this point, so the unscoped
         # EXPUNGE is exactly what was asked for here - nothing else can be hit
-        conn.expunge()
+        with self._alive(f"emptying '{trash_folder}'"):
+            typ, _ = conn.expunge()
+        if typ != "OK":
+            raise CleanerError(
+                f"The server refused to empty '{trash_folder}'. Messages are "
+                "marked deleted but have not been permanently removed.",
+                hint="Check the Trash folder before retrying.",
+            )
         return len(uids)
 
     def __enter__(self) -> "ImapSession":

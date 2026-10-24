@@ -437,15 +437,14 @@ def cmd_clean(args) -> int:
         approved = False
         trash = None
         for attempt in range(1, max_passes + 1):
-            # re-open the folder each pass: on a server that only exposes part
-            # of it, this is what lets the mail we just moved out be replaced
-            # by older mail we could not previously see
-            session.select(args.folder, readonly=False)
-            if repeating:
-                ui.heading(f"Pass {attempt} of at most {max_passes}")
             try:
+                # Re-open inside the recovery guard: a server can drop the
+                # connection between passes as well as during a search or move.
+                session.select(args.folder, readonly=False)
+                if repeating:
+                    ui.heading(f"Pass {attempt} of at most {max_passes}")
                 result = _run_scan(session, args, filters, classifier)
-                if attempt == 1:
+                if not approved:
                     _show_report(result, explain=args.ai_explain)
                 elif result.emails:
                     ui.info(
@@ -476,10 +475,13 @@ def cmd_clean(args) -> int:
                         on_progress=lambda d, t: ui.progress(d, t, "Moving to Trash"),
                     )
             except ConnectionLost as exc:
-                # nothing is half-done: the next pass re-runs its own search, so
-                # whatever already moved stays moved and the rest is picked up
-                # again. Only worth retrying when there are passes left to use.
-                if not repeating or reconnects >= _MAX_RECONNECTS:
+                # A fresh search resumes atomic moves and deletes. Copy-based
+                # moves may have left both copies behind, so stop those rather
+                # than blindly duplicating mail. A retry also needs a pass left.
+                if (
+                    not repeating or not exc.retry_safe or attempt >= max_passes
+                    or reconnects >= _MAX_RECONNECTS
+                ):
                     lost = exc
                     stopped_by = "the server hung up"
                     break
@@ -514,7 +516,9 @@ def cmd_clean(args) -> int:
             stopped_by = f"reached the {max_passes}-pass limit"
 
         if args.empty_trash and not args.permanent:
-            if moved_total:
+            if lost is not None:
+                ui.warn("The connection was lost, so the Trash was left as it is.")
+            elif moved_total:
                 trash = trash or session.find_trash_folder(account.trash_folder)
                 emptied = _empty_trash_step(session, args, trash)
             else:

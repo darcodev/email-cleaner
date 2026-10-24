@@ -5,6 +5,7 @@ Run with:  python -m unittest discover -s tests -v
 
 import dataclasses
 import imaplib
+import io
 import json
 import os
 import socket
@@ -384,6 +385,67 @@ class TestHeaderSearchFallback(unittest.TestCase):
         self.assertNotIn("unsubscribe", res.query_description.lower())
 
 
+class TestLimitAfterSafetyFilters(unittest.TestCase):
+    def test_protected_mail_does_not_use_up_the_limit(self):
+        mail = [_mail("1", sender="Boss <boss@work.com>"), _mail("2"), _mail("3")]
+        server = _PickyServer(mail, refuse_header=False)
+        result = scan(server, Filters(limit=1, protected_senders=["work.com"]))
+        self.assertEqual([e.uid for e in result.emails], ["2"])
+        self.assertEqual(result.skipped_protected, 1)
+
+    def test_starred_mail_does_not_use_up_the_limit(self):
+        mail = [dataclasses.replace(_mail("1"), flagged=True), _mail("2"), _mail("3")]
+        server = _PickyServer(mail, refuse_header=False)
+        result = scan(server, Filters(limit=1))
+        self.assertEqual([e.uid for e in result.emails], ["2"])
+        self.assertEqual(result.skipped_starred, 1)
+
+    def test_gmail_safety_recheck_also_precedes_the_limit(self):
+        server = _PickyServer([_mail("1", sender="Boss <boss@work.com>"), _mail("2")])
+        server.supports_gmail_search = True
+        server.search_gmail_raw = lambda query: ["1", "2"]
+        result = scan(server, Filters(limit=1, protected_senders=["work.com"]))
+        self.assertEqual([e.uid for e in result.emails], ["2"])
+
+    def test_zero_or_negative_limit_fetches_no_headers(self):
+        for limit in (0, -1):
+            for refuse_header in (False, True):
+                with self.subTest(limit=limit, fallback=refuse_header):
+                    server = _PickyServer([_promo("1")], refuse_header=refuse_header)
+                    result = scan(server, Filters(limit=limit))
+                    self.assertEqual(result.emails, [])
+                    self.assertEqual(server.full_header_fetches, [])
+
+    def test_a_disappeared_message_does_not_use_up_the_limit(self):
+        server = _PickyServer([_mail("2"), _mail("3")], refuse_header=False)
+        server.search_standard = lambda criteria: ["1", "2", "3"]
+        result = scan(server, Filters(limit=1))
+        self.assertEqual([e.uid for e in result.emails], ["2"])
+
+    def test_limit_still_caps_the_mail_sent_to_ai(self):
+        server = _PickyServer([_mail("1"), _mail("2"), _mail("3")], refuse_header=False)
+        classifier = mock.Mock(wants_snippet=False)
+        classifier.classify.return_value = {"1": Verdict(delete=True), "2": Verdict(delete=True)}
+        result = scan(server, Filters(limit=2), classifier=classifier)
+        self.assertEqual([e.uid for e in result.emails], ["1", "2"])
+        candidates = classifier.classify.call_args.args[0]
+        self.assertEqual([e.uid for e in candidates], ["1", "2"])
+
+    def test_an_early_stop_finishes_progress_without_fetching_the_rest(self):
+        for refuse_header in (False, True):
+            with self.subTest(fallback=refuse_header):
+                server = _PickyServer([_promo(str(i)) for i in range(1, 1002)],
+                                      refuse_header=refuse_header)
+                ticks = []
+                result = scan(server, Filters(limit=1),
+                              on_progress=lambda done, total: ticks.append((done, total)))
+                self.assertEqual([e.uid for e in result.emails], ["1"])
+                self.assertEqual(len(server.full_header_fetches), 1)
+                done, total = ticks[-1]
+                self.assertEqual(done, total)
+                self.assertLess(done, len(server.mail))
+
+
 class TestSearchErrorsAreCatchable(unittest.TestCase):
     """imaplib raises on a BAD reply before the status reaches _search_result,
     so a refused search used to surface as a traceback."""
@@ -643,6 +705,51 @@ class TestExpungeScope(unittest.TestCase):
         session, _ = _fake_session(["UIDPLUS"], fail_on=("STORE",))
         with self.assertRaises(CleanerError):
             session.move_to_trash(["7"], "Trash")
+
+
+class TestRefusedExpunge(unittest.TestCase):
+    def test_refused_uid_expunge_does_not_report_a_delete(self):
+        session, _ = _fake_session(["UIDPLUS"], fail_on=("EXPUNGE",))
+        with self.assertRaises(CleanerError):
+            session.delete_permanently(["1"])
+
+    def test_refused_uid_expunge_does_not_report_a_move(self):
+        session, _ = _fake_session(["UIDPLUS"], fail_on=("EXPUNGE",))
+        with self.assertRaises(CleanerError):
+            session.move_to_trash(["1"], "Trash")
+
+    def test_refused_unscoped_expunge_does_not_report_a_delete(self):
+        session, conn = _fake_session()
+        conn.expunge = mock.Mock(return_value=("NO", [b"purge refused"]))
+        with self.assertRaises(CleanerError):
+            session.delete_permanently(["1"])
+
+    def test_refused_trash_expunge_does_not_report_empty_trash(self):
+        session, conn = _fake_session()
+        session.search_standard = mock.Mock(return_value=["1", "2"])
+        conn.expunge = mock.Mock(return_value=("NO", [b"purge refused"]))
+        with self.assertRaises(CleanerError):
+            session.empty_trash("Trash")
+
+    def test_cli_returns_error_for_a_refused_purge(self):
+        for flags in (["--permanent"], ["--empty-trash"], []):
+            with self.subTest(flags=flags):
+                session, conn = _fake_session(["UIDPLUS"], fail_on=("EXPUNGE",))
+                session.connect = mock.Mock()
+                session.search_standard = mock.Mock(return_value=["1"])
+                session.fetch_summaries = mock.Mock(return_value=[_mail("1")])
+                session.find_trash_folder = mock.Mock(return_value="Trash")
+                conn.expunge = mock.Mock(return_value=("NO", [b"purge refused"]))
+                with mock.patch.object(cli.config, "resolve_account", return_value=_acct()), \
+                     mock.patch.object(cli, "ImapSession", return_value=session), \
+                     mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                     mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    rc = cli.main(["clean", "--yes", *flags])
+                self.assertEqual(rc, 2)
+                self.assertIn("refused", stderr.getvalue())
+                self.assertNotIn("emails deleted", stdout.getvalue())
+                self.assertNotIn("emails moved to Trash", stdout.getvalue())
+                self.assertNotIn("Trash emptied:", stdout.getvalue())
 
 
 class TestCapabilities(unittest.TestCase):
@@ -1698,6 +1805,93 @@ class TestConnectionDrops(unittest.TestCase):
         with self.assertRaises(ConnectionLost):
             session.search_standard(["ALL"])
 
+    def test_a_drop_while_opening_a_folder_is_not_a_traceback(self):
+        session, conn = _fake_session()
+        conn.select = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+        with self.assertRaises(ConnectionLost):
+            session.select("INBOX", readonly=False)
+        self.assertTrue(session._lost)
+
+    def test_a_drop_while_reading_the_folder_count_is_not_swallowed(self):
+        session, conn = _fake_session()
+        conn.status = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+        with self.assertRaises(ConnectionLost):
+            session.select("INBOX", readonly=False)
+        self.assertTrue(session._lost)
+
+    def test_a_drop_after_copying_is_not_a_traceback(self):
+        session, conn = _fake_session(["UIDPLUS"])
+
+        def uid(command, *args):
+            if command == "STORE":
+                raise imaplib.IMAP4.abort("Server logging out")
+            return "OK", [None]
+
+        conn.uid = uid
+        with self.assertRaises(ConnectionLost) as caught:
+            session.move_to_trash(["1"], "Trash")
+        self.assertFalse(caught.exception.retry_safe)
+        self.assertIn("both folders", caught.exception.hint)
+
+    def test_an_interrupted_copy_move_cannot_be_blindly_retried(self):
+        for during in ("COPY", "EXPUNGE"):
+            with self.subTest(during=during):
+                session, conn = _fake_session(["UIDPLUS"])
+
+                def uid(command, *args):
+                    if command == during:
+                        raise imaplib.IMAP4.abort("Server logging out")
+                    return "OK", [None]
+
+                conn.uid = uid
+                with self.assertRaises(ConnectionLost) as caught:
+                    session.move_to_trash(["1"], "Trash")
+                self.assertFalse(caught.exception.retry_safe)
+
+    def test_a_drop_while_purging_is_not_a_traceback(self):
+        for capabilities in ([], ["UIDPLUS"]):
+            with self.subTest(capabilities=capabilities):
+                session, conn = _fake_session(capabilities)
+
+                def uid(command, *args):
+                    if command == "EXPUNGE":
+                        raise imaplib.IMAP4.abort("Server logging out")
+                    return "OK", [None]
+
+                conn.uid = uid
+                conn.expunge = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+                with self.assertRaises(ConnectionLost):
+                    session.delete_permanently(["1"])
+
+    def test_a_drop_while_emptying_trash_is_not_a_traceback(self):
+        for during in ("STORE", "EXPUNGE"):
+            with self.subTest(during=during):
+                session, conn = _fake_session()
+                session.search_standard = mock.Mock(return_value=["1"])
+                if during == "STORE":
+                    conn.uid = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+                else:
+                    conn.expunge = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+                with self.assertRaises(ConnectionLost):
+                    session.empty_trash("Trash")
+
+    def test_a_drop_while_finding_trash_is_not_swallowed(self):
+        session, conn = _fake_session()
+        conn.list = mock.Mock(side_effect=imaplib.IMAP4.abort("Server logging out"))
+        with self.assertRaises(ConnectionLost):
+            session.find_trash_folder()
+
+    def test_a_socket_failure_is_a_connection_loss(self):
+        for exc in (ConnectionResetError("reset"), socket.timeout("timed out")):
+            with self.subTest(error=type(exc).__name__):
+                session, conn = _fake_session()
+                conn.uid = mock.Mock(side_effect=exc)
+                with self.assertRaises(ConnectionLost):
+                    session.fetch_summaries(["1"])
+                self.assertTrue(session._lost)
+                with self.assertRaises(ConnectionLost):
+                    session.search_standard(["ALL"])
+
     def test_it_still_prints_like_any_other_error(self):
         self.assertTrue(issubclass(ConnectionLost, CleanerError))
 
@@ -1797,6 +1991,64 @@ class TestRepeatSurvivesADrop(unittest.TestCase):
         args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
         _, text = self._drive(server, args)
         self.assertIn("3 emails moved to Trash", text)
+
+    def test_a_drop_while_reopening_the_folder_is_recovered(self):
+        server = self._FlakyServer([["1"], ["2"]], drop_on_pass=99)
+        real_select = server.select
+
+        def select(folder, readonly=True):
+            if server.selects == 1 and not server.reconnects:
+                raise ConnectionLost("The server closed the connection.")
+            return real_select(folder, readonly=readonly)
+
+        server.select = select
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        rc, text = self._drive(server, args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(server.reconnects, 1)
+        self.assertEqual(server.moved, [["1"], ["2"]])
+
+    def test_a_drop_on_the_last_pass_is_not_success(self):
+        for max_passes in (1, 2):
+            with self.subTest(max_passes=max_passes):
+                server = self._FlakyServer([["1"], ["2"]], drop_on_pass=max_passes)
+                args = cli.build_parser().parse_args([
+                    "clean", "--yes", "--repeat", "--max-passes", str(max_passes),
+                ])
+                rc, text = self._drive(server, args)
+                self.assertEqual(rc, 2)
+                self.assertEqual(server.reconnects, 0)
+                self.assertIn("the server hung up", text)
+
+    def test_a_dead_connection_is_not_used_to_empty_trash(self):
+        server = self._FlakyServer([["1"], ["2"]], drop_on_pass=2)
+        args = cli.build_parser().parse_args([
+            "clean", "--yes", "--repeat", "--max-passes", "2", "--empty-trash",
+        ])
+        rc, text = self._drive(server, args)
+        self.assertEqual(rc, 2)
+        self.assertEqual(server.emptied, 0)
+        self.assertIn("Trash was left", text)
+
+    def test_a_copy_move_with_uncertain_results_is_not_retried(self):
+        server = self._FlakyServer([["1"]], drop_on_pass=99)
+        server.move_to_trash = mock.Mock(side_effect=ConnectionLost(
+            "The connection dropped during COPY.", retry_safe=False,
+        ))
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        rc, text = self._drive(server, args)
+        self.assertEqual(rc, 2)
+        self.assertEqual(server.reconnects, 0)
+        server.move_to_trash.assert_called_once()
+
+    def test_a_successful_scan_after_a_drop_is_still_previewed(self):
+        server = self._FlakyServer([["1"]], drop_on_pass=1)
+        args = cli.build_parser().parse_args(["clean", "--yes", "--repeat"])
+        with mock.patch.object(cli, "_show_report") as report:
+            rc, text = self._drive(server, args)
+        self.assertEqual(rc, 0)
+        self.assertEqual(report.call_count, 1)
+        self.assertEqual([e.uid for e in report.call_args.args[0].emails], ["1"])
 
 
 class TestResolveAiSettings(unittest.TestCase):

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from .errors import CleanerError, SearchUnsupported
 from .imap_client import (
+    FETCH_BATCH,
     FULL_FETCH_BATCH,
     EmailSummary,
     ImapSession,
@@ -231,29 +232,34 @@ def _drop_reason(summary: EmailSummary, filters: Filters, local_promo: bool) -> 
     return None
 
 
-def _fetch_until_enough(session, uids: list[str], filters: Filters, on_progress):
-    """Fetch full headers in chunks, stopping once --limit is satisfied.
+def _fetch_until_enough(
+    session, uids: list[str], filters: Filters, on_progress, local_promo: bool
+):
+    """Fetch until --limit eligible messages survive the local safety checks.
 
-    Only for the fallback path, where the server hands back every candidate and
-    the promotional test happens here. A small --limit is usually satisfied in
-    the first chunk, so fetching all of them - at roughly twelve times the bytes
-    of a normal header fetch - is a long wait for a result already in hand.
+    Protected, starred and vanished messages must not use up the cap. Keep the
+    fetch bounded so a small limit does not require reading the whole folder.
     """
     wanted = max(filters.limit or 0, 0)
+    if wanted == 0:
+        return []
     out: list[EmailSummary] = []
     survivors = 0
+    size = FULL_FETCH_BATCH if local_promo else min(FETCH_BATCH, wanted)
     # this path drives progress itself, so it owns the opening tick too -
     # otherwise the first chunk is several more seconds of blank terminal
     if on_progress and uids:
         on_progress(0, len(uids))
-    for start in range(0, len(uids), FULL_FETCH_BATCH):
-        chunk = uids[start : start + FULL_FETCH_BATCH]
-        batch = session.fetch_summaries(chunk, full_headers=True)
+    for start in range(0, len(uids), size):
+        chunk = uids[start : start + size]
+        batch = session.fetch_summaries(chunk, full_headers=local_promo)
         out.extend(batch)
-        survivors += sum(1 for s in batch if _drop_reason(s, filters, True) is None)
+        survivors += sum(1 for s in batch if _drop_reason(s, filters, local_promo) is None)
+        finished = survivors >= wanted
         if on_progress:
-            on_progress(min(start + len(chunk), len(uids)), len(uids))
-        if survivors >= wanted:
+            done = min(start + len(chunk), len(uids))
+            on_progress(done, done if finished else len(uids))
+        if finished:
             break
     return out
 
@@ -332,18 +338,11 @@ def scan(
         if local_promo:
             description += " " + _PROMO_LOCAL_NOTE
 
-    # with the fallback the server hands back more than we want, so the cap has
-    # to wait until the non-promotional mail has been dropped - otherwise
-    # --limit 100 would trim to 100 candidates and then keep only the promos
-    # among them, which is not what "stop after this many matches" promises
-    if not local_promo:
-        uids = _apply_limit(uids, filters.limit)
-
-    # the fallback filters on List-Unsubscribe here, so it needs a fetch that
-    # actually carries it - the narrow field list comes back without it on the
-    # very servers that send us down this path
-    if local_promo and filters.limit is not None:
-        summaries = _fetch_until_enough(session, uids, filters, on_progress)
+    # Apply the cap after the safety filters on every server. Otherwise a
+    # protected sender at the start of a limited search can make a nonempty
+    # folder look as though nothing matches.
+    if filters.limit is not None:
+        summaries = _fetch_until_enough(session, uids, filters, on_progress, local_promo)
     else:
         summaries = session.fetch_summaries(
             uids, on_progress=on_progress, full_headers=local_promo
@@ -365,8 +364,7 @@ def scan(
     skipped_starred = dropped["starred"]
     skipped_not_promo = dropped["not_promo"]
 
-    if local_promo:
-        kept = _apply_limit(kept, filters.limit)
+    kept = _apply_limit(kept, filters.limit)
 
     # AI pass runs last and only on the survivors, so protected and starred mail
     # is never sent to it (and a hosted backend only ever sees the candidates).
